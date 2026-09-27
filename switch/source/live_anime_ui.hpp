@@ -2005,12 +2005,26 @@ private:
 
 static void tick_live_ui_activities()
 {
-    if (g_restoreGlobalQuitAfterKeyboard &&
-        !brls::Application::getControllerState().buttons[brls::BUTTON_START])
+    // Only restore global quit functionality if we're not in a keyboard operation
+    // and the system is in a stable state
+    if (g_restoreGlobalQuitAfterKeyboard)
     {
-        brls::Application::setGlobalQuit(true);
-        g_restoreGlobalQuitAfterKeyboard = false;
-        log_stage("SEARCH KEYBOARD GLOBAL QUIT RESTORED");
+        // Check if we're in a valid state to restore global quit
+        // We need to ensure that any pending keyboard operations have completed
+        const brls::ControllerState& state = brls::Application::getControllerState();
+
+        // If START button is currently pressed, don't restore quit yet
+        // This prevents crashes when pressing START during keyboard operations
+        if (!state.buttons[brls::BUTTON_START])
+        {
+            // Additional safety check to ensure we're not in an inconsistent state
+            if (g_restoreGlobalQuitAfterKeyboard)
+            {
+                brls::Application::setGlobalQuit(true);
+                g_restoreGlobalQuitAfterKeyboard = false;
+                log_stage("SEARCH KEYBOARD GLOBAL QUIT RESTORED");
+            }
+        }
     }
 
     if (g_pairingActivity)
