@@ -2,21 +2,16 @@
 
 #include <borealis.hpp>
 #include <curl/curl.h>
-#include "kaa_crypto.hpp"
 #include <switch/applets/swkbd.h>
 #include <switch/services/nifm.h>
 #include <switch.h>
 #include "api_sources.hpp"
-#include "mpv_player.hpp"
 
 #include <algorithm>
 #include <atomic>
 #include <cctype>
-#include <chrono>
 #include <cstdio>
 #include <functional>
-#include <map>
-#include <memory>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -32,41 +27,6 @@
 #include <unistd.h>
 
 static void log_stage(const char* stage);
-static std::string replace_all(std::string value, const std::string& from, const std::string& to)
-{
-    if (from.empty()) return value;
-    size_t pos = 0;
-    while ((pos = value.find(from, pos)) != std::string::npos)
-    {
-        value.replace(pos, from.size(), to);
-        pos += to.size();
-    }
-    return value;
-}
-
-
-static const auto g_perfStart = std::chrono::steady_clock::now();
-
-static long long perf_elapsed_ms()
-{
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - g_perfStart).count();
-}
-
-static void perf_log(const char* stage)
-{
-    char marker[224];
-    std::snprintf(marker, sizeof(marker), "PERF %lldms | %s", perf_elapsed_ms(), stage);
-    log_stage(marker);
-}
-
-static void perf_log_count(const char* stage, size_t count)
-{
-    char marker[224];
-    std::snprintf(marker, sizeof(marker), "PERF %lldms | %s count=%zu",
-        perf_elapsed_ms(), stage, count);
-    log_stage(marker);
-}
 
 struct SaikouAnime
 {
@@ -74,10 +34,6 @@ struct SaikouAnime
     int score = 0;
     int episodes = 0;
     std::string title;
-    std::string englishTitle;
-    std::string romajiTitle;
-    std::string nativeTitle;
-    std::string userPreferredTitle;
     std::string coverUrl;
     std::string bannerUrl;
     std::string description;
@@ -86,19 +42,13 @@ struct SaikouAnime
     std::string posterPath;
 };
 
-static bool g_providerEnabled[kApiSourceCount] = { true, true };
-static std::string g_providerBaseUrl[kApiSourceCount] = {};
-static std::string g_providerFallbackBaseUrl[kApiSourceCount] = {};
+static bool g_providerEnabled[kApiSourceCount] = { true, true, true, true, true };
 static int g_selectedApiSource = 0;
 static bool g_restoreGlobalQuitAfterKeyboard = false;
 static std::atomic<unsigned int> g_anilistAccountRevision{ 0 };
-static bool g_socketOwned = false;
-static bool g_curlOwned = false;
 static constexpr const char* kSettingsPath = "sdmc:/switch/SaikouTV/settings.ini";
 static constexpr const char* kAniListTokenPath = "sdmc:/switch/SaikouTV/anilistToken";
 static constexpr const char* kCacheDir = "sdmc:/switch/SaikouTV/cache";
-static constexpr const char* kLocalContinuePath = "sdmc:/switch/SaikouTV/continue.ini";
-static constexpr size_t kLocalContinueCapacity = 120;
 
 static void register_page_back_action(brls::View* root)
 {
@@ -120,9 +70,10 @@ static bool ensure_network_ready()
 {
     static std::once_flag once;
     static Result socketResult = MAKERESULT(Module_Libnx, LibnxError_AlreadyInitialized);
+    static bool socketOwned = false;
     std::call_once(once, [] {
         socketResult = socketInitializeDefault();
-        g_socketOwned = R_SUCCEEDED(socketResult);
+        socketOwned = R_SUCCEEDED(socketResult);
     });
     return R_SUCCEEDED(socketResult) ||
         socketResult == MAKERESULT(Module_Libnx, LibnxError_AlreadyInitialized);
@@ -132,33 +83,8 @@ static bool ensure_curl_ready()
 {
     static std::once_flag once;
     static CURLcode result = CURLE_FAILED_INIT;
-    std::call_once(once, [] {
-        result = curl_global_init(CURL_GLOBAL_DEFAULT);
-        g_curlOwned = result == CURLE_OK;
-    });
+    std::call_once(once, [] { result = curl_global_init(CURL_GLOBAL_DEFAULT); });
     return result == CURLE_OK;
-}
-
-static void shutdown_network()
-{
-    // All activity-owned network workers are joined during Borealis Application::exit()
-    // before libnx calls userAppExit(). Release cURL first, then our socket service.
-    if (g_curlOwned)
-    {
-        curl_global_cleanup();
-        g_curlOwned = false;
-    }
-
-    if (g_socketOwned)
-    {
-        socketExit();
-        g_socketOwned = false;
-    }
-}
-
-extern "C" void userAppExit(void)
-{
-    shutdown_network();
 }
 
 static size_t append_http_data(char* data, size_t size, size_t count, void* userdata)
@@ -173,99 +99,48 @@ static size_t append_http_data(char* data, size_t size, size_t count, void* user
 }
 
 static bool http_request(const std::string& url, const std::string* postBody,
-    std::string& response, long timeoutSeconds = 10, const std::string* bearerToken = nullptr,
-    const char* userAgent = nullptr,
-    const std::vector<std::string>* extraHeaders = nullptr)
+    std::string& response, long timeoutSeconds = 10, const std::string* bearerToken = nullptr)
 {
     if (!ensure_network_ready() || !ensure_curl_ready())
         return false;
 
-    static constexpr int kMaxAttempts = 2;
-
-    for (int attempt = 1; attempt <= kMaxAttempts; ++attempt)
-    {
-        response.clear();
-
-        CURL* curl = curl_easy_init();
-        if (!curl)
-            return false;
-
-        struct curl_slist* headers = nullptr;
-        headers = curl_slist_append(headers, "Accept: application/json");
-        if (postBody)
-            headers = curl_slist_append(headers, "Content-Type: application/json");
-        if (bearerToken && !bearerToken->empty())
-        {
-            const std::string authHeader = "Authorization: Bearer " + *bearerToken;
-            headers = curl_slist_append(headers, authHeader.c_str());
-        }
-        if (extraHeaders)
-        {
-            for (const std::string& extra : *extraHeaders)
-                headers = curl_slist_append(headers, extra.c_str());
-        }
-
-        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-        curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 3L);
-        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
-        curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeoutSeconds);
-        curl_easy_setopt(curl, CURLOPT_USERAGENT,
-            (userAgent && *userAgent) ? userAgent : "SaikouTV-NX/0.3");
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, append_http_data);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-
-        if (postBody)
-        {
-            curl_easy_setopt(curl, CURLOPT_POST, 1L);
-            curl_easy_setopt(curl, CURLOPT_POSTFIELDS, postBody->c_str());
-            curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(postBody->size()));
-        }
-
-        const CURLcode requestResult = curl_easy_perform(curl);
-        long httpCode = 0;
-        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
-
-        const bool success =
-            requestResult == CURLE_OK && httpCode >= 200 && httpCode < 300;
-
-        const bool retryableHttp =
-            httpCode == 429 || httpCode >= 500;
-
-        const bool retryableCurl =
-            requestResult == CURLE_OPERATION_TIMEDOUT ||
-            requestResult == CURLE_COULDNT_CONNECT ||
-            requestResult == CURLE_COULDNT_RESOLVE_HOST ||
-            requestResult == CURLE_RECV_ERROR ||
-            requestResult == CURLE_SEND_ERROR ||
-            requestResult == CURLE_GOT_NOTHING;
-
-        char marker[256];
-        std::snprintf(marker, sizeof(marker),
-            "HTTP ATTEMPT %d/%d result=%d http=%ld bytes=%zu retry=%d url=%.120s",
-            attempt, kMaxAttempts, static_cast<int>(requestResult), httpCode,
-            response.size(),
-            (!success && attempt < kMaxAttempts && (retryableHttp || retryableCurl)) ? 1 : 0,
-            url.c_str());
-        log_stage(marker);
-
-        curl_slist_free_all(headers);
-        curl_easy_cleanup(curl);
-
-        if (success)
-            return true;
-
-        if (attempt < kMaxAttempts && (retryableHttp || retryableCurl))
-        {
-            std::this_thread::sleep_for(std::chrono::milliseconds(400));
-            continue;
-        }
-
+    CURL* curl = curl_easy_init();
+    if (!curl)
         return false;
+
+    struct curl_slist* headers = nullptr;
+    headers = curl_slist_append(headers, "Accept: application/json");
+    if (postBody)
+        headers = curl_slist_append(headers, "Content-Type: application/json");
+    if (bearerToken && !bearerToken->empty())
+    {
+        const std::string authHeader = "Authorization: Bearer " + *bearerToken;
+        headers = curl_slist_append(headers, authHeader.c_str());
     }
 
-    return false;
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 3L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeoutSeconds);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "SaikouTV-NX/0.3");
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, append_http_data);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+
+    if (postBody)
+    {
+        curl_easy_setopt(curl, CURLOPT_POST, 1L);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, postBody->c_str());
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(postBody->size()));
+    }
+
+    const CURLcode requestResult = curl_easy_perform(curl);
+    long httpCode = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    return requestResult == CURLE_OK && httpCode >= 200 && httpCode < 300;
 }
 
 static void append_utf8(std::string& out, unsigned int cp)
@@ -520,14 +395,10 @@ static SaikouAnime parse_anime_object(const std::string& object)
     anime.bannerUrl = json_string_field(object, "bannerImage");
 
     const std::string title = json_object_field(object, "title");
-    anime.englishTitle = json_string_field(title, "english");
-    anime.romajiTitle = json_string_field(title, "romaji");
-    anime.nativeTitle = json_string_field(title, "native");
-    anime.userPreferredTitle = json_string_field(title, "userPreferred");
-    anime.title = anime.englishTitle;
-    if (anime.title.empty()) anime.title = anime.userPreferredTitle;
-    if (anime.title.empty()) anime.title = anime.romajiTitle;
-    if (anime.title.empty()) anime.title = anime.nativeTitle;
+    anime.title = json_string_field(title, "english");
+    if (anime.title.empty()) anime.title = json_string_field(title, "userPreferred");
+    if (anime.title.empty()) anime.title = json_string_field(title, "romaji");
+    if (anime.title.empty()) anime.title = json_string_field(title, "native");
 
     const std::string cover = json_object_field(object, "coverImage");
     anime.coverUrl = json_string_field(cover, "extraLarge");
@@ -536,8 +407,7 @@ static SaikouAnime parse_anime_object(const std::string& object)
     return anime;
 }
 
-static std::vector<SaikouAnime> parse_anilist_media(
-    const std::string& response, size_t maxItems = 24)
+static std::vector<SaikouAnime> parse_anilist_media(const std::string& response)
 {
     std::vector<SaikouAnime> media;
     size_t arrayAt = response.find("\"media\"");
@@ -545,7 +415,7 @@ static std::vector<SaikouAnime> parse_anilist_media(
     arrayAt = response.find('[', arrayAt);
     if (arrayAt == std::string::npos) return media;
 
-    for (size_t p = arrayAt + 1; p < response.size() && media.size() < maxItems;)
+    for (size_t p = arrayAt + 1; p < response.size() && media.size() < 24;)
     {
         while (p < response.size() && (std::isspace(static_cast<unsigned char>(response[p])) || response[p] == ',')) ++p;
         if (p >= response.size() || response[p] == ']') break;
@@ -576,8 +446,7 @@ static std::vector<SaikouAnime> parse_anilist_media(
     return media;
 }
 
-static std::vector<SaikouAnime> fetch_anilist_media(
-    const std::string& search, int pageSize, std::string& status, int page = 1)
+static std::vector<SaikouAnime> fetch_anilist_media(const std::string& search, int pageSize, std::string& status)
 {
     static const std::string endpoint = "https://graphql.anilist.co";
     const std::string query =
@@ -590,7 +459,7 @@ static std::vector<SaikouAnime> fetch_anilist_media(
         "} } }";
 
     std::string body = "{\"query\":" + json_quote(query) +
-        ",\"variables\":{\"page\":" + std::to_string(page) + ",\"perPage\":" + std::to_string(pageSize) +
+        ",\"variables\":{\"page\":1,\"perPage\":" + std::to_string(pageSize) +
         ",\"search\":" + (search.empty() ? "null" : json_quote(search)) + "}}";
     std::string response;
     if (!http_request(endpoint, &body, response, 12))
@@ -602,110 +471,9 @@ static std::vector<SaikouAnime> fetch_anilist_media(
 
     std::vector<SaikouAnime> result = parse_anilist_media(response);
     char marker[96];
-    std::snprintf(marker, sizeof(marker),
-        "ANILIST MEDIA PAGE %d FOUND %zu ITEMS", page, result.size());
+    std::snprintf(marker, sizeof(marker), "ANILIST MEDIA FOUND %zu ITEMS", result.size());
     log_stage(marker);
     status = result.empty() ? "AniList returned no anime." : "Live AniList data";
-    return result;
-}
-
-static std::vector<SaikouAnime> fetch_anilist_trending_page(
-    int page, int pageSize, std::string& status)
-{
-    static const std::string endpoint = "https://graphql.anilist.co";
-    const std::string query =
-        "query ($page: Int, $perPage: Int) { "
-        "Page(page: $page, perPage: $perPage) { "
-        "media(type: ANIME, sort: TRENDING_DESC) { "
-        "id title { english romaji native userPreferred } "
-        "coverImage { large extraLarge } bannerImage averageScore format status episodes "
-        "description(asHtml: false) "
-        "} } }";
-
-    const std::string body = "{\"query\":" + json_quote(query) +
-        ",\"variables\":{\"page\":" + std::to_string(page) +
-        ",\"perPage\":" + std::to_string(pageSize) + "}}";
-    std::string response;
-    if (!http_request(endpoint, &body, response, 12))
-    {
-        status = "AniList could not be reached. Check the Switch internet connection.";
-        log_stage("ANILIST TRENDING PAGE REQUEST FAILED");
-        return {};
-    }
-
-    std::vector<SaikouAnime> result =
-        parse_anilist_media(response, static_cast<size_t>(pageSize));
-    char marker[128];
-    std::snprintf(marker, sizeof(marker),
-        "ANILIST TRENDING PAGE %d FOUND %zu ITEMS", page, result.size());
-    log_stage(marker);
-    status = result.empty() ? "AniList returned no more trending anime." : "Live AniList trending data";
-    return result;
-}
-
-static std::vector<SaikouAnime> fetch_currently_airing_page(
-    int page, int pageSize, std::string& status)
-{
-    static const std::string endpoint = "https://graphql.anilist.co";
-    const std::string query =
-        "query ($page: Int, $perPage: Int) { "
-        "Page(page: $page, perPage: $perPage) { "
-        "media(type: ANIME, status: RELEASING, sort: POPULARITY_DESC) { "
-        "id title { english romaji native userPreferred } "
-        "coverImage { large extraLarge } bannerImage averageScore format status episodes "
-        "description(asHtml: false) "
-        "} } }";
-
-    const std::string body = "{\"query\":" + json_quote(query) +
-        ",\"variables\":{\"page\":" + std::to_string(page) +
-        ",\"perPage\":" + std::to_string(pageSize) + "}}";
-    std::string response;
-    if (!http_request(endpoint, &body, response, 12))
-    {
-        status = "AniList could not be reached. Check the Switch internet connection.";
-        log_stage("ANILIST AIRING PAGE REQUEST FAILED");
-        return {};
-    }
-
-    std::vector<SaikouAnime> result =
-        parse_anilist_media(response, static_cast<size_t>(pageSize));
-    char marker[128];
-    std::snprintf(marker, sizeof(marker),
-        "ANILIST AIRING PAGE %d FOUND %zu ITEMS", page, result.size());
-    log_stage(marker);
-    status = result.empty()
-        ? "AniList returned no more currently airing anime."
-        : "Live AniList currently airing data";
-    return result;
-}
-
-static std::vector<SaikouAnime> fetch_currently_airing_media(int pageSize, std::string& status)
-{
-    static const std::string endpoint = "https://graphql.anilist.co";
-    const std::string query =
-        "query ($page: Int, $perPage: Int) { "
-        "Page(page: $page, perPage: $perPage) { "
-        "media(type: ANIME, status: RELEASING, sort: POPULARITY_DESC) { "
-        "id title { english romaji native userPreferred } "
-        "coverImage { large extraLarge } bannerImage averageScore format status episodes "
-        "description(asHtml: false) "
-        "} } }";
-
-    std::string body = "{\"query\":" + json_quote(query) +
-        ",\"variables\":{\"page\":1,\"perPage\":" + std::to_string(pageSize) + "}}";
-    std::string response;
-    if (!http_request(endpoint, &body, response, 12))
-    {
-        status = "AniList could not be reached. Check the Switch internet connection.";
-        log_stage("ANILIST AIRING REQUEST FAILED");
-        return {};
-    }
-
-    std::vector<SaikouAnime> result = parse_anilist_media(response);
-    char marker[128];
-    std::snprintf(marker, sizeof(marker), "ANILIST AIRING FOUND %zu ITEMS", result.size());
-    log_stage(marker);
-    status = result.empty() ? "AniList returned no currently airing anime." : "Live AniList currently airing data";
     return result;
 }
 
@@ -904,7 +672,7 @@ static void initialize_source_settings()
 
     FILE* file = std::fopen(kSettingsPath, "r");
     if (!file) return;
-    char line[512];
+    char line[128];
     while (std::fgets(line, sizeof(line), file))
     {
         std::string value(line);
@@ -913,18 +681,6 @@ static void initialize_source_settings()
             const std::string key = std::string(kApiSources[i].slug) + "=";
             if (value.find(key) == 0)
                 g_providerEnabled[i] = value[key.size()] == '1';
-            const std::string urlKey = std::string(kApiSources[i].slug) + "_url=";
-            const std::string fallbackKey = std::string(kApiSources[i].slug) + "_fallback_url=";
-            if (value.find(urlKey) == 0)
-                g_providerBaseUrl[i] = value.substr(urlKey.size());
-            if (value.find(fallbackKey) == 0)
-                g_providerFallbackBaseUrl[i] = value.substr(fallbackKey.size());
-            for (std::string* configuredUrl : { &g_providerBaseUrl[i], &g_providerFallbackBaseUrl[i] })
-            {
-                while (!configuredUrl->empty() &&
-                    (configuredUrl->back() == '\n' || configuredUrl->back() == '\r'))
-                    configuredUrl->pop_back();
-            }
         }
         if (value.find("selected=") == 0)
             g_selectedApiSource = std::atoi(value.c_str() + 9);
@@ -941,1050 +697,9 @@ static void save_source_settings()
     FILE* file = std::fopen(kSettingsPath, "w");
     if (!file) return;
     for (size_t i = 0; i < kApiSourceCount; ++i)
-    {
         std::fprintf(file, "%s=%d\n", kApiSources[i].slug, g_providerEnabled[i] ? 1 : 0);
-        std::fprintf(file, "%s_url=%s\n", kApiSources[i].slug, g_providerBaseUrl[i].c_str());
-        std::fprintf(file, "%s_fallback_url=%s\n", kApiSources[i].slug, g_providerFallbackBaseUrl[i].c_str());
-    }
     std::fprintf(file, "selected=%d\n", g_selectedApiSource);
     std::fclose(file);
-}
-
-
-struct ProviderEpisode
-{
-    int number = 0;
-    std::string title;
-    std::string id;
-    std::string provider;
-    std::string category;
-};
-
-struct ProviderStream
-{
-    std::string url;
-    std::string quality;
-    std::string type;
-    std::vector<std::string> headers;
-};
-
-static std::string encode_url_component(const std::string& input)
-{
-    static const char hex[] = "0123456789ABCDEF";
-    std::string output;
-    for (unsigned char c : input)
-    {
-        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~')
-            output.push_back(static_cast<char>(c));
-        else
-        {
-            output.push_back('%');
-            output.push_back(hex[c >> 4]);
-            output.push_back(hex[c & 15]);
-        }
-    }
-    return output;
-}
-
-static std::string trim_api_base(std::string base)
-{
-    while (!base.empty() && (base.back() == '/' || base.back() == ' '))
-        base.pop_back();
-    while (!base.empty() && base.front() == ' ')
-        base.erase(base.begin());
-    return base;
-}
-
-static std::string first_array(const std::string& json,
-    const std::vector<std::string>& fields)
-{
-    for (const std::string& field : fields)
-    {
-        std::string value = json_array_field(json, field);
-        if (!value.empty())
-            return value;
-    }
-    return {};
-}
-
-static std::string first_string(const std::string& json,
-    const std::vector<std::string>& fields)
-{
-    for (const std::string& field : fields)
-    {
-        std::string value = json_string_field(json, field);
-        if (!value.empty())
-            return value;
-    }
-    return {};
-}
-
-static std::string first_array_in_data(const std::string& json,
-    const std::vector<std::string>& fields)
-{
-    std::string value = first_array(json, fields);
-    if (!value.empty()) return value;
-    const std::string data = json_object_field(json, "data");
-    return first_array(data, fields);
-}
-
-static std::vector<ProviderEpisode> parse_provider_episode_array(const std::string& array)
-{
-    std::vector<ProviderEpisode> episodes;
-    for (const std::string& object : json_object_array(array))
-    {
-        ProviderEpisode item;
-        item.number = json_int_field(object, "episodeNumber");
-        if (item.number <= 0) item.number = json_int_field(object, "episode");
-        if (item.number <= 0) item.number = json_int_field(object, "number");
-        if (item.number <= 0) item.number = json_int_field(object, "order");
-        item.id = first_string(object, { "epId", "episodeId", "id", "session", "slug", "url" });
-        if (item.id.empty())
-        {
-            const int numericId = json_int_field(object, "id");
-            if (numericId > 0) item.id = std::to_string(numericId);
-        }
-        item.title = first_string(object, { "title", "name", "alternativeTitle" });
-        if (item.number <= 0 && item.title.empty())
-            continue;
-        if (item.title.empty())
-            item.title = "Episode " + std::to_string(item.number);
-        episodes.push_back(std::move(item));
-    }
-    std::stable_sort(episodes.begin(), episodes.end(),
-        [](const ProviderEpisode& a, const ProviderEpisode& b) {
-            if (a.number == 0) return false;
-            if (b.number == 0) return true;
-            return a.number < b.number;
-        });
-    return episodes;
-}
-
-static size_t json_value_end(const std::string& json, size_t start)
-{
-    while (start < json.size() && std::isspace(static_cast<unsigned char>(json[start]))) ++start;
-    if (start >= json.size()) return start;
-    if (json[start] == '"')
-    {
-        bool escaped = false;
-        for (size_t i = start + 1; i < json.size(); ++i)
-        {
-            if (escaped) escaped = false;
-            else if (json[i] == '\\') escaped = true;
-            else if (json[i] == '"') return i + 1;
-        }
-        return json.size();
-    }
-    if (json[start] == '{' || json[start] == '[')
-    {
-        int depth = 0;
-        bool quoted = false, escaped = false;
-        for (size_t i = start; i < json.size(); ++i)
-        {
-            const char c = json[i];
-            if (quoted)
-            {
-                if (escaped) escaped = false;
-                else if (c == '\\') escaped = true;
-                else if (c == '"') quoted = false;
-                continue;
-            }
-            if (c == '"') quoted = true;
-            else if (c == '{' || c == '[') ++depth;
-            else if ((c == '}' || c == ']') && --depth == 0) return i + 1;
-        }
-        return json.size();
-    }
-    size_t end = start;
-    while (end < json.size() && json[end] != ',' && json[end] != '}' && json[end] != ']') ++end;
-    return end;
-}
-
-static std::vector<std::pair<std::string, std::string>> json_object_members(const std::string& object)
-{
-    std::vector<std::pair<std::string, std::string>> members;
-    if (object.empty() || object.front() != '{') return members;
-    size_t pos = 1;
-    while (pos < object.size())
-    {
-        while (pos < object.size() && (std::isspace(static_cast<unsigned char>(object[pos])) ||
-            object[pos] == ',')) ++pos;
-        if (pos >= object.size() || object[pos] == '}') break;
-        if (object[pos] != '"') break;
-        size_t keyEnd = pos + 1;
-        bool escaped = false;
-        for (; keyEnd < object.size(); ++keyEnd)
-        {
-            if (escaped) escaped = false;
-            else if (object[keyEnd] == '\\') escaped = true;
-            else if (object[keyEnd] == '"') break;
-        }
-        if (keyEnd >= object.size()) break;
-        const std::string key = decode_json_string(object, pos);
-        pos = keyEnd + 1;
-        while (pos < object.size() && std::isspace(static_cast<unsigned char>(object[pos]))) ++pos;
-        if (pos >= object.size() || object[pos++] != ':') break;
-        while (pos < object.size() && std::isspace(static_cast<unsigned char>(object[pos]))) ++pos;
-        const size_t end = json_value_end(object, pos);
-        if (end <= pos) break;
-        members.emplace_back(key, object.substr(pos, end - pos));
-        pos = end;
-    }
-    return members;
-}
-
-static std::vector<ProviderEpisode> parse_miruro_episodes(const std::string& json)
-{
-    // Keep Miruro's provider/audio context; its episode ID is also the /watch route.
-    std::vector<ProviderEpisode> episodes;
-    const std::string providers = json_object_field(json, "providers");
-    for (const auto& providerMember : json_object_members(providers))
-    {
-        const std::string episodeGroups = json_object_field(providerMember.second, "episodes");
-        auto appendEpisodes = [&](const std::string& category, const std::string& array) {
-            for (const std::string& object : json_object_array(array))
-            {
-                ProviderEpisode item;
-                item.number = json_int_field(object, "episodeNumber");
-                if (item.number <= 0) item.number = json_int_field(object, "number");
-                if (item.number <= 0) item.number = json_int_field(object, "episode");
-                item.id = first_string(object, { "id", "episodeId", "slug", "url" });
-                item.title = first_string(object, { "title", "name" });
-                item.provider = providerMember.first;
-                item.category = category;
-                if (item.number <= 0 || item.id.empty()) continue;
-                if (item.id.front() == '/') item.id.erase(item.id.begin());
-                if (item.title.empty()) item.title = "Episode " + std::to_string(item.number);
-                episodes.push_back(std::move(item));
-            }
-        };
-        if (!episodeGroups.empty() && episodeGroups.front() == '{')
-        {
-            for (const auto& categoryMember : json_object_members(episodeGroups))
-                appendEpisodes(categoryMember.first, categoryMember.second);
-        }
-        else if (!episodeGroups.empty() && episodeGroups.front() == '[')
-        {
-            appendEpisodes("sub", episodeGroups);
-        }
-    }
-
-    // Compatibility with older flat Miruro responses.
-    if (episodes.empty())
-    {
-        std::string array = first_array(json, { "episodes", "data" });
-        for (const std::string& object : json_object_array(array))
-        {
-            ProviderEpisode item;
-            item.number = json_int_field(object, "episodeNumber");
-            if (item.number <= 0) item.number = json_int_field(object, "number");
-            if (item.number <= 0) item.number = json_int_field(object, "episode");
-            item.id = first_string(object, { "id", "episodeId", "slug", "url" });
-            item.title = first_string(object, { "title", "name" });
-            item.provider = first_string(object, { "provider" });
-            item.category = first_string(object, { "category" });
-            if (item.number > 0 && !item.id.empty())
-            {
-                if (item.id.front() == '/') item.id.erase(item.id.begin());
-                if (item.title.empty()) item.title = "Episode " + std::to_string(item.number);
-                episodes.push_back(std::move(item));
-            }
-        }
-    }
-
-    std::stable_sort(episodes.begin(), episodes.end(),
-        [](const ProviderEpisode& a, const ProviderEpisode& b) {
-            if (a.number != b.number) return a.number < b.number;
-            if (a.provider != b.provider) return a.provider < b.provider;
-            return a.category < b.category;
-        });
-    episodes.erase(std::unique(episodes.begin(), episodes.end(),
-        [](const ProviderEpisode& a, const ProviderEpisode& b) {
-            return a.number == b.number && a.id == b.id &&
-                a.provider == b.provider && a.category == b.category;
-        }), episodes.end());
-    return episodes;
-}
-
-
-static std::string kaa_host(const std::string& url)
-{
-    const size_t scheme = url.find("://");
-    const size_t start = scheme == std::string::npos ? 0 : scheme + 3;
-    const size_t end = url.find_first_of("/?#", start);
-    return url.substr(start, end == std::string::npos ? std::string::npos : end - start);
-}
-
-static std::string kaa_query_value(const std::string& url, const std::string& key)
-{
-    const size_t q = url.find('?');
-    if (q == std::string::npos) return {};
-    size_t p = q + 1;
-    while (p < url.size())
-    {
-        const size_t amp = url.find('&', p);
-        const std::string part = url.substr(p, amp == std::string::npos ? std::string::npos : amp - p);
-        const std::string needle = key + "=";
-        if (part.rfind(needle, 0) == 0) return part.substr(needle.size());
-        if (amp == std::string::npos) break;
-        p = amp + 1;
-    }
-    return {};
-}
-
-static std::string kaa_unescape_url(std::string value)
-{
-    value = replace_all(value, "\\/", "/");
-    value = replace_all(value, "\\u0026", "&");
-    return value;
-}
-
-static std::string kaa_fix_url(const std::string& raw, const std::string& base)
-{
-    std::string value = kaa_unescape_url(raw);
-    if (value.rfind("https://", 0) == 0 || value.rfind("http://", 0) == 0) return value;
-    if (value.rfind("//", 0) == 0) return "https:" + value;
-    if (value.rfind("/", 0) == 0) return "https://" + kaa_host(base) + value;
-    return value;
-}
-
-static std::string kaa_signature_url(const std::string& serverUrl, const std::string& serverName,
-    const std::string& html)
-{
-    const size_t cidAt = html.find("cid: '");
-    if (cidAt == std::string::npos) return {};
-    const size_t cidStart = cidAt + 6;
-    const size_t cidEnd = html.find('\'', cidStart);
-    if (cidEnd == std::string::npos) return {};
-    const std::string cidHex = html.substr(cidStart, cidEnd - cidStart);
-    const std::string cidRaw = crypto::fromHex(cidHex);
-    const size_t sep = cidRaw.find('|');
-    if (sep == std::string::npos) return {};
-    const std::string ip = cidRaw.substr(0, sep);
-    const size_t routeStart = sep + 1;
-    const std::string playerRoute = cidRaw.substr(routeStart);
-    if (ip.empty() || playerRoute.empty()) return {};
-
-    const std::string route = replace_all(playerRoute, "player.php", "source.php");
-    const std::string mid = serverName == "DuckStream" ? "mid" : "id";
-    const std::string midValue = kaa_query_value(serverUrl, mid);
-    if (midValue.empty()) return {};
-
-    const std::string key =
-        serverName == "VidStreaming" ? "e13d38099bf562e8b9851a652d2043d3" :
-        serverName == "DuckStream" ? "4504447b74641ad972980a6b8ffd7631" :
-        serverName == "BirdStream" ? "4b14d0ff625163e3c9c7a47926484bf2" : "";
-    if (key.empty()) return {};
-
-    const std::string timestamp = std::to_string(static_cast<long long>(std::time(nullptr)) + 60);
-    std::string data = ip + "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/129.0.0.0 Mobile Safari/537.36" + route + midValue;
-    if (serverName != "BirdStream") data += timestamp;
-    data += key;
-
-    std::string sourceUrl = "https://" + kaa_host(serverUrl) + route + "?" + mid + "=" + midValue;
-    if (serverName != "BirdStream") sourceUrl += "&e=" + timestamp;
-    sourceUrl += "&s=" + crypto::toHex(crypto::sha1(data));
-    return sourceUrl;
-}
-
-static std::vector<ProviderStream> kaa_hls_streams(const std::string& masterUrl, const std::string& serverName,
-    const std::string& referer, const std::string& playlist)
-{
-    std::vector<ProviderStream> out;
-    out.push_back({masterUrl, serverName + " - Auto", "HLS", {"Referer: " + referer, "Origin: https://" + kaa_host(referer)}});
-    size_t pos = 0;
-    while ((pos = playlist.find("#EXT-X-STREAM-INF", pos)) != std::string::npos)
-    {
-        const size_t lineEnd = playlist.find('\n', pos);
-        const std::string info = playlist.substr(pos, lineEnd == std::string::npos ? std::string::npos : lineEnd - pos);
-        const size_t next = lineEnd == std::string::npos ? playlist.size() : lineEnd + 1;
-        size_t u = next;
-        while (u < playlist.size() && (playlist[u] == '\r' || playlist[u] == '\n' || playlist[u] == ' ')) ++u;
-        const size_t uriEnd = playlist.find_first_of("\r\n", u);
-        if (u >= playlist.size()) break;
-        const std::string uri = playlist.substr(u, uriEnd == std::string::npos ? std::string::npos : uriEnd - u);
-        const size_t res = info.find("RESOLUTION=");
-        int height = 0;
-        if (res != std::string::npos)
-        {
-            const size_t x = info.find('x', res);
-            if (x != std::string::npos) height = std::atoi(info.c_str() + x + 1);
-        }
-        if (!uri.empty())
-        {
-            ProviderStream item;
-            item.url = kaa_fix_url(uri, masterUrl);
-            item.quality = serverName + " - " + (height > 0 ? std::to_string(height) + "p" : "Video");
-            item.type = "HLS";
-            item.headers = {"Referer: " + referer, "Origin: https://" + kaa_host(referer)};
-            out.push_back(std::move(item));
-        }
-        pos = next;
-    }
-    return out;
-}
-
-static std::vector<ProviderStream> kaa_extract_server(const std::string& serverUrl,
-    const std::string& serverName, std::string& status)
-{
-    static constexpr const char* kVideoUA =
-        "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/129.0.0.0 Mobile Safari/537.36";
-    std::vector<std::string> pageHeaders = {
-        "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-    };
-    std::string html;
-    if (!http_request(serverUrl, nullptr, html, 25, nullptr, kVideoUA, &pageHeaders))
-    {
-        log_stage(("KAA EXTRACT PAGE FAILED server=" + serverName).c_str());
-        return {};
-    }
-    log_stage(("KAA EXTRACT PAGE OK server=" + serverName + " bytes=" + std::to_string(html.size())).c_str());
-
-    // New Astro-style KAA player: the page embeds manifest:[0,"//..."].
-    std::string clean = replace_all(html, "&quot;", "\"");
-    const std::string manifestMarker = "manifest\":[0,\"";
-    const size_t manifestAt = clean.find(manifestMarker);
-    if (manifestAt != std::string::npos)
-    {
-        size_t p = manifestAt + manifestMarker.size();
-        size_t e = clean.find('"', p);
-        if (e != std::string::npos)
-        {
-            const std::string manifest = kaa_fix_url(clean.substr(p, e - p), serverUrl);
-            std::vector<std::string> h = {
-                "Accept: */*",
-                "Referer: " + serverUrl,
-                "Origin: https://" + kaa_host(serverUrl)
-            };
-            std::string playlist;
-            if (http_request(manifest, nullptr, playlist, 25, nullptr, kVideoUA, &h))
-            {
-                log_stage(("KAA EXTRACT MANIFEST OK server=" + serverName + " bytes=" + std::to_string(playlist.size())).c_str());
-                return kaa_hls_streams(manifest, serverName, serverUrl, playlist);
-            }
-            return {{manifest, serverName + " - Auto", "HLS", {"Referer: " + serverUrl, "Origin: https://" + kaa_host(serverUrl)}}};
-        }
-    }
-
-    const std::string sourceUrl = kaa_signature_url(serverUrl, serverName, html);
-    if (sourceUrl.empty())
-    {
-        log_stage(("KAA EXTRACT UNSUPPORTED server=" + serverName).c_str());
-        return {};
-    }
-
-    std::vector<std::string> sourceHeaders = {
-        "Accept: */*",
-        "Referer: " + serverUrl,
-        "Origin: https://" + kaa_host(serverUrl)
-    };
-    std::string response;
-    if (!http_request(sourceUrl, nullptr, response, 25, nullptr, kVideoUA, &sourceHeaders))
-    {
-        log_stage(("KAA EXTRACT SOURCE FAILED server=" + serverName).c_str());
-        return {};
-    }
-    log_stage(("KAA EXTRACT SOURCE OK server=" + serverName + " bytes=" + std::to_string(response.size())).c_str());
-
-    const size_t q = response.find(":\"");
-    if (q == std::string::npos) return {};
-    const size_t valueStart = q + 2;
-    const size_t valueEnd = response.find("\"", valueStart);
-    if (valueEnd == std::string::npos) return {};
-    std::string payload = response.substr(valueStart, valueEnd - valueStart);
-    payload = replace_all(payload, "\\\\", "\\");
-    const size_t colon = payload.find(':');
-    if (colon == std::string::npos) return {};
-    const std::string encrypted = payload.substr(0, colon);
-    const std::string ivHex = payload.substr(colon + 1);
-    try
-    {
-        const std::string decrypted = crypto::aesCbcDecrypt(
-            crypto::base64Decode(encrypted), 
-            serverName == "VidStreaming" ? "e13d38099bf562e8b9851a652d2043d3" :
-            serverName == "DuckStream" ? "4504447b74641ad972980a6b8ffd7631" :
-            "4b14d0ff625163e3c9c7a47926484bf2",
-            crypto::fromHex(ivHex));
-        const std::string hls = json_string_field(decrypted, "hls");
-        const std::string dash = json_string_field(decrypted, "dash");
-        const std::string playlistUrl = kaa_fix_url(hls.empty() ? dash : hls, serverUrl);
-        if (playlistUrl.empty()) return {};
-        log_stage(("KAA EXTRACT DECRYPTED stream=" + (hls.empty() ? dash : hls)).c_str());
-        if (!hls.empty())
-        {
-            std::vector<std::string> ph = {"Accept: */*", "Referer: " + serverUrl,
-                "Origin: https://" + kaa_host(serverUrl)};
-            std::string playlist;
-            if (http_request(playlistUrl, nullptr, playlist, 25, nullptr, kVideoUA, &ph))
-                return kaa_hls_streams(playlistUrl, serverName, serverUrl, playlist);
-        }
-        return {{playlistUrl, serverName + " - Auto", hls.empty() ? "DASH" : "HLS", {"Referer: " + serverUrl, "Origin: https://" + kaa_host(serverUrl)}}};
-    }
-    catch (const std::exception&)
-    {
-        log_stage(("KAA EXTRACT DECRYPT FAILED server=" + serverName).c_str());
-        return {};
-    }
-}
-
-static std::vector<ProviderStream> fetch_kaa_sources(
-    const ProviderEpisode& episode, std::string& status)
-{
-    if (episode.id.empty())
-    {
-        status = "KickAssAnime did not provide an episode route.";
-        return {};
-    }
-
-    // AnikkuNX's native KAA flow:
-    // /api/show/{anime-slug}/episode/ep-{number}-{slug}
-    // returns { "servers": [ { "name": ..., "src": ... }, ... ] }.
-    // AnikkuNX's actual KAA video endpoint inserts /episode before /ep-*.
-    // episode.id is the episode path returned by /episodes (e.g. /ep-1-5d81fc).
-    std::string episodePath = episode.id;
-    if (episodePath.rfind("/episode/", 0) != 0)
-    {
-        const size_t ep = episodePath.find("/ep-");
-        if (ep != std::string::npos)
-            episodePath.insert(ep, "/episode");
-        else if (episodePath.rfind("ep-", 0) == 0)
-            episodePath = "/episode/" + episodePath;
-    }
-
-    const std::string route =
-        "https://kaa.lt/api/show" + episodePath;
-    std::string response;
-
-    log_stage(("KAA SOURCE REQUEST route=" + route).c_str());
-    static constexpr const char* kKaaBrowserUA =
-        "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/129.0.0.0 Mobile Safari/537.36";
-
-    if (!http_request(route, nullptr, response, 25, nullptr, kKaaBrowserUA))
-    {
-        status = "KickAssAnime source request failed (see HTTP log).";
-        log_stage("KAA SOURCE REQUEST FAILED");
-        return {};
-    }
-
-    const std::string servers = first_array(response, { "servers" });
-    if (servers.empty())
-    {
-        status = "KickAssAnime returned no server sources.";
-        log_stage("KAA SOURCE RESPONSE HAD NO SERVERS");
-        return {};
-    }
-    log_stage(("KAA SOURCE RESPONSE bytes=" + std::to_string(response.size())).c_str());
-
-    std::vector<ProviderStream> sources;
-    for (const std::string& object : json_object_array(servers))
-    {
-        const std::string name = first_string(object, { "name", "server", "provider" });
-        const std::string src = first_string(object, { "src", "url", "source" });
-
-        if (name.empty() || src.empty())
-            continue;
-
-        ProviderStream item;
-        item.url = src;
-        item.quality = name;
-        item.type = "source";
-        sources.push_back(std::move(item));
-
-        log_stage(("KAA SOURCE FOUND name=" + name).c_str());
-    }
-
-    if (sources.empty())
-    {
-        status = "KickAssAnime returned no usable source servers.";
-        return {};
-    }
-
-    std::vector<ProviderStream> resolved;
-    for (const ProviderStream& source : sources)
-    {
-        log_stage(("KAA EXTRACT START server=" + source.quality).c_str());
-        std::vector<ProviderStream> videos = kaa_extract_server(source.url, source.quality, status);
-        resolved.insert(resolved.end(), videos.begin(), videos.end());
-        if (!videos.empty())
-            log_stage(("KAA EXTRACT READY server=" + source.quality + " count=" + std::to_string(videos.size())).c_str());
-    }
-
-    status = resolved.empty()
-        ? "KickAssAnime found servers, but could not extract a playable stream."
-        : "KickAssAnime extracted " + std::to_string(resolved.size()) + " playable stream option(s).";
-    char marker[128];
-    std::snprintf(marker, sizeof(marker),
-        "KAA STREAMS FINAL count=%zu", resolved.size());
-    log_stage(marker);
-    return resolved;
-}
-
-static std::vector<ProviderStream> parse_miruro_streams(const std::string& json)
-{
-    std::string array = first_array_in_data(json, { "streams", "sources" });
-    if (array.empty() && !json.empty() && json.front() == '[') array = json;
-    std::vector<ProviderStream> streams;
-    for (const std::string& object : json_object_array(array))
-    {
-        ProviderStream item;
-        item.url = first_string(object, { "url", "file", "src" });
-        item.quality = first_string(object, { "quality", "label", "resolution" });
-        item.type = first_string(object, { "type", "format" });
-        if (!item.url.empty()) streams.push_back(std::move(item));
-    }
-    return streams;
-}
-
-static std::vector<ProviderStream> fetch_miruro_streams(
-    const ProviderEpisode& episode, std::string& status)
-{
-    if (episode.id.empty() || episode.id.find("watch/") != 0)
-    {
-        status = "Miruro did not provide a valid /watch route for this episode.";
-        return {};
-    }
-    const size_t sourceId = static_cast<size_t>(ApiSourceId::Miruro);
-    const std::string roots[] = {
-        trim_api_base(g_providerBaseUrl[sourceId]),
-        trim_api_base(g_providerFallbackBaseUrl[sourceId])
-    };
-    for (size_t i = 0; i < 2; ++i)
-    {
-        if (roots[i].empty() || (i == 1 && roots[i] == roots[0])) continue;
-        std::string response;
-        if (!http_request(roots[i] + "/" + episode.id, nullptr, response, 25)) continue;
-        const size_t first = response.find_first_not_of(" \\t\\r\\n");
-        if (first == std::string::npos || response[first] != '{') continue;
-        std::vector<ProviderStream> streams = parse_miruro_streams(response);
-        if (!streams.empty())
-        {
-            status = "Miruro returned " + std::to_string(streams.size()) + " stream option(s).";
-            log_stage(i == 0 ? "MIRURO STREAMS READY" : "MIRURO STREAMS READY FROM FALLBACK");
-            return streams;
-        }
-    }
-    status = "Miruro returned no streams for this provider/episode.";
-    log_stage("MIRURO STREAM RESOLUTION EMPTY OR FAILED");
-    return {};
-}
-
-static std::vector<std::string> provider_search_titles(const SaikouAnime& anime)
-{
-    // Match the Android title lookup behavior: search the English name first,
-    // then retry with the AniList romaji/Japanese names if that search has no hit.
-    const std::string candidates[] = {
-        anime.englishTitle,
-        anime.title,
-        anime.romajiTitle,
-        anime.nativeTitle,
-        anime.userPreferredTitle
-    };
-    std::vector<std::string> titles;
-    for (const std::string& candidate : candidates)
-    {
-        if (candidate.empty()) continue;
-        bool duplicate = false;
-        for (const std::string& existing : titles)
-            if (existing == candidate) duplicate = true;
-        if (!duplicate) titles.push_back(candidate);
-    }
-    return titles;
-}
-
-
-static std::string ak_vrf_exchange(std::string v,const std::string&a,const std::string&b){for(char&c:v){size_t p=a.find(c);if(p!=std::string::npos)c=b[p];}return v;}
-static std::string ak_vrf_encrypt(const std::string& input){std::string v=ak_vrf_exchange(input,"AP6GeR8H0lwUz1","UAz8Gwl10P6ReH");v=crypto::base64Encode(crypto::rc4("ItFKjuWokn4ZpB",v),true,true);v=crypto::base64Encode(crypto::rc4("fOyt97QWFB3",v),true,true);v=ak_vrf_exchange(v,"1majSlPQd2M5","da1l2jSmP5QM");v=ak_vrf_exchange(v,"CPYvHj09Au3","0jHA9CPYu3v");std::reverse(v.begin(),v.end());return encode_url_component(crypto::base64Encode(crypto::rc4("736y1uTJpBLUX",v),true,true));}
-static std::string ak_attr(const std::string&s,size_t at,const std::string&key){std::string n=key+"=\"";size_t p=s.find(n,at);char q='"';if(p==std::string::npos){n=key+"='";p=s.find(n,at);q='\'';}if(p==std::string::npos)return{};p+=n.size();size_t e=s.find(q,p);return e==std::string::npos?std::string():s.substr(p,e-p);}
-static std::string ak_result_html(const std::string&b){return json_string_field(b,"result");}
-static std::vector<ProviderEpisode> ak_parse_episodes(const std::string&f,const std::string&path){std::vector<ProviderEpisode>o;size_t p=0;while((p=f.find("data-num=",p))!=std::string::npos){size_t a=f.rfind("<a",p);if(a==std::string::npos){p+=9;continue;}size_t e=f.find('>',p);if(e==std::string::npos)break;std::string num=ak_attr(f,a,"data-num"),ids=ak_attr(f,a,"data-ids");if(num.empty()||ids.empty()){p=e+1;continue;}ProviderEpisode x;x.number=std::atoi(num.c_str());x.id=ids+"&epurl="+strip_ep_suffix(path)+"/ep-"+num;x.provider="AnimeKai";x.category="Sub/Dub";std::string slug=ak_attr(f,a,"data-slug"),mal=ak_attr(f,a,"data-mal"),ts=ak_attr(f,a,"data-timestamp");if(!slug.empty())x.id+="&slug="+slug;if(!mal.empty())x.id+="&mal="+mal;if(!ts.empty())x.id+="&ts="+ts;o.push_back(std::move(x));p=e+1;}std::reverse(o.begin(),o.end());return o;}
-static std::vector<std::pair<std::string,std::string>> ak_servers(const std::string&f){std::vector<std::pair<std::string,std::string>>o;size_t p=0;while((p=f.find("data-link-id=",p))!=std::string::npos){size_t a=f.rfind("<li",p);if(a==std::string::npos)a=f.rfind("<span",p);if(a==std::string::npos)a=p;std::string id=ak_attr(f,a,"data-link-id");size_t e=f.find('>',p);if(id.empty()||e==std::string::npos){p=e==std::string::npos?f.size():e+1;continue;}size_t z=f.find("</li>",e);if(z==std::string::npos||z>e+300)z=std::min(f.size(),e+250);std::string name=trim(f.substr(e+1,z-e-1));size_t lt=name.find('<');if(lt!=std::string::npos)name.resize(lt);if(name.empty())name="AnimeKai";o.push_back({id,trim(name)});p=e+1;}return o;}
-static std::vector<ProviderStream> ak_hls(const std::string&master,const std::string&server,const std::string&referer,const std::vector<std::string>&headers){std::string b;std::vector<std::string>h=headers;h.push_back("Referer: "+referer);std::vector<ProviderStream>o;if(http_request(master,nullptr,b,25,nullptr,nullptr,&h)&&b.find("#EXT-X-STREAM-INF")!=std::string::npos){size_t p=0;while((p=b.find("#EXT-X-STREAM-INF",p))!=std::string::npos){size_t le=b.find('\n',p),u=le==std::string::npos?std::string::npos:le+1;if(u!=std::string::npos){while(u<b.size()&&(b[u]=='\r'||b[u]=='\n'))u++;size_t ue=b.find('\n',u);std::string url=trim(b.substr(u,ue==std::string::npos?std::string::npos:ue-u));if(!url.empty()&&url[0]!='#'){if(url.rfind("http",0)!=0){size_t s=master.rfind('/');if(s!=std::string::npos)url=master.substr(0,s+1)+url;}int height=0;std::string info=b.substr(p,le==std::string::npos?std::string::npos:le-p);size_t rr=info.find("RESOLUTION="),xx=rr==std::string::npos?std::string::npos:info.find('x',rr);if(xx!=std::string::npos)height=std::atoi(info.c_str()+xx+1);ProviderStream v;v.url=url;v.quality=server+" - "+(height?std::to_string(height)+"p":"Auto");v.type="HLS";v.headers=headers;o.push_back(std::move(v));}}p=le==std::string::npos?b.size():le+1;}}if(o.empty()){ProviderStream v;v.url=master;v.quality=server+" - Auto";v.type="HLS";v.headers=headers;o.push_back(std::move(v));}return o;}
-static std::vector<ProviderStream> animekai_extract_server(const std::string&embed,const std::string&server){std::string page;std::vector<std::string>ph={"Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"};if(!http_request(embed,nullptr,page,25,nullptr,nullptr,&ph))return{};size_t dp=page.find("data-id=");std::string media=dp==std::string::npos?std::string():ak_attr(page,dp,"data-id");if(media.empty())return{};std::string host=kaa_host(embed),origin="https://"+host,api=origin+"/stream/getSources?id="+encode_url_component(media);size_t sp=embed.find("?s=");if(sp!=std::string::npos){size_t se=embed.find('&',sp);api+="&s="+encode_url_component(embed.substr(sp+3,se==std::string::npos?std::string::npos:se-sp-3));}std::vector<std::string>ah={"Accept: application/json,*/*","X-Requested-With: XMLHttpRequest","Referer: "+embed};std::string res;if(!http_request(api,nullptr,res,25,nullptr,nullptr,&ah))return{};std::string m=json_string_field(res,"file"),enc=json_string_field(res,"enc");if(!enc.empty()){try{std::string d=crypto::base64Decode(enc);std::string k("i?LMTAx0Q6,:}50U");k.resize(32,'\0');if(!d.empty()&&d.size()%16==0){std::string js=crypto::aesCbcDecrypt(d,k,"W0;27ToaUpl_P%'c");size_t f=js.find("\"file\""),col=f==std::string::npos?std::string::npos:js.find(':',f);if(col!=std::string::npos){size_t q=js.find('"',col+1),e=q==std::string::npos?std::string::npos:js.find('"',q+1);if(q!=std::string::npos&&e!=std::string::npos)m=js.substr(q+1,e-q-1);}}}catch(...){}}if(m.empty())return{};return ak_hls(m,server,origin+"/",{"Origin: "+origin});}
-static std::vector<ProviderStream> fetch_animekai_sources(const ProviderEpisode&ep,std::string&status){const std::string base="https://animekaitv.to";size_t p=ep.id.find("&epurl=");if(p==std::string::npos){status="AnimeKai episode route malformed.";return{};}std::string ids=ep.id.substr(0,p),epurl=substringBefore(ep.id.substr(p+7),"&"),body;std::vector<std::string>h={"Accept: application/json, text/javascript, */*; q=0.01","Referer: "+base+epurl,"X-Requested-With: XMLHttpRequest"};if(!http_request(base+"/ajax/server/list?servers="+ids,nullptr,body,25,nullptr,nullptr,&h)){status="AnimeKai server list request failed.";return{};}auto sv=ak_servers(ak_result_html(body));if(sv.empty()){status="AnimeKai returned no servers.";return{};}std::vector<ProviderStream>out;for(auto&s:sv){std::string lb;if(!http_request(base+"/ajax/server?get="+s.first,nullptr,lb,25,nullptr,nullptr,&h))continue;std::string embed=json_string_field(lb,"url");if(embed.empty())continue;auto v=animekai_extract_server(embed,s.second);out.insert(out.end(),v.begin(),v.end());}status=out.empty()?"AnimeKai servers found, but no playable streams were extracted.":"AnimeKai extracted "+std::to_string(out.size())+" stream option(s).";return out;}
-
-static std::vector<ProviderEpisode> fetch_provider_episodes(
-    const SaikouAnime& anime, int sourceId, std::string& status)
-{
-    if (sourceId < 0 || static_cast<size_t>(sourceId) >= kApiSourceCount)
-    {
-        status = "Invalid episode provider.";
-        return {};
-    }
-    const std::string base = trim_api_base(g_providerBaseUrl[sourceId]);
-    const std::string fallback = trim_api_base(g_providerFallbackBaseUrl[sourceId]);
-    if (base.empty() && fallback.empty() &&
-        static_cast<ApiSourceId>(sourceId) != ApiSourceId::KickAssAnime)
-    {
-        status = std::string(kApiSources[sourceId].name) +
-            " scraper API address is missing. Add a deployed API root in Settings.";
-        return {};
-    }
-
-    bool nonJsonResponseSeen = false;
-    auto get = [&](const std::string& path, std::string& body) {
-        const std::string roots[] = { base, fallback };
-        for (size_t i = 0; i < 2; ++i)
-        {
-            if (roots[i].empty() || (i == 1 && roots[i] == roots[0])) continue;
-            if (!http_request(roots[i] + path, nullptr, body, 20))
-                continue;
-            const size_t first = body.find_first_not_of(" \\t\\r\\n");
-            if (first == std::string::npos || (body[first] != '{' && body[first] != '['))
-            {
-                nonJsonResponseSeen = true;
-                log_stage("EPISODE API RESPONSE IS NOT JSON; trying next base URL");
-                continue;
-            }
-            if (i == 1) log_stage("EPISODE API FALLBACK USED");
-            return true;
-        }
-        return false;
-    };
-    auto get_any = [&](const std::vector<std::string>& paths, std::string& body) {
-        for (const std::string& path : paths)
-            if (get(path, body)) return true;
-        return false;
-    };
-    std::string response;
-    std::vector<ProviderEpisode> episodes;
-
-    switch (static_cast<ApiSourceId>(sourceId))
-    {
-        case ApiSourceId::Miruro:
-        {
-            if (anime.id <= 0 || !get("/episodes/" + std::to_string(anime.id), response))
-                break;
-            episodes = parse_miruro_episodes(response);
-            break;
-        }
-        case ApiSourceId::AnimePahe:
-        {
-            std::string session;
-            for (const std::string& title : provider_search_titles(anime))
-            {
-                const std::string query = encode_url_component(title);
-                if (!get_any({ "/search?q=" + query, "/api/search?q=" + query }, response))
-                    continue;
-                std::string results = first_array(response, { "data", "results", "search" });
-                if (results.empty() && !response.empty() && response.front() == '[') results = response;
-                for (const std::string& object : json_object_array(results))
-                {
-                    session = first_string(object, { "session", "id", "animeSession" });
-                    if (!session.empty()) break;
-                }
-                if (!session.empty()) break;
-                log_stage("ANIMEPAHE TITLE SEARCH HAD NO MATCH; trying next AniList title");
-            }
-            if (session.empty()) break;
-
-            int page = 1;
-            for (; page <= 100; ++page)
-            {
-                std::string releases;
-                const std::string pageText = std::to_string(page);
-                const std::string sessionValue = encode_url_component(session);
-                const std::string nodePath = "/api/" + sessionValue +
-                    "/releases?sort=episode_asc&page=" + pageText;
-                const std::string pythonPath = "/episodes?session=" + sessionValue;
-                if (!get_any({ pythonPath, nodePath }, releases)) break;
-                std::string data = first_array(releases, { "data", "episodes", "results" });
-                if (data.empty() && !releases.empty() && releases.front() == '[') data = releases;
-                std::vector<ProviderEpisode> batch = parse_provider_episode_array(data);
-                episodes.insert(episodes.end(), batch.begin(), batch.end());
-                const int lastPage = json_int_field(json_object_field(releases, "paginationInfo"), "lastPage");
-                const int pythonLastPage = json_int_field(releases, "last_page");
-                const int pages = lastPage > 0 ? lastPage : pythonLastPage;
-                if (pages <= 0 || page >= pages || batch.empty() ||
-                    (releases.front() == '[' && page == 1)) break;
-            }
-            break;
-        }
-        case ApiSourceId::Aniwatch:
-        {
-            std::string animeId;
-            for (const std::string& title : provider_search_titles(anime))
-            {
-                if (!get("/api/search/" + encode_url_component(title) + "/1", response))
-                    continue;
-                const std::string results = first_array(response, { "searchYour", "results", "response", "data" });
-                for (const std::string& object : json_object_array(results))
-                {
-                    animeId = first_string(object, { "idanime", "id", "animeId" });
-                    if (animeId.empty())
-                    {
-                        const int numericId = json_int_field(object, "idanime");
-                        if (numericId > 0) animeId = std::to_string(numericId);
-                    }
-                    if (!animeId.empty()) break;
-                }
-                if (!animeId.empty()) break;
-                log_stage("ANIWATCH TITLE SEARCH HAD NO MATCH; trying next AniList title");
-            }
-            if (animeId.empty()) break;
-            if (!get("/api/episode/" + encode_url_component(animeId), response))
-                break;
-            episodes = parse_provider_episode_array(
-                first_array(response, { "episodetown", "episodes", "response", "data" }));
-            break;
-        }
-        case ApiSourceId::HiAnime:
-        {
-            std::string animeId;
-            for (const std::string& title : provider_search_titles(anime))
-            {
-                if (!get("/api/v2/search?keyword=" + encode_url_component(title), response))
-                    continue;
-                const std::string results = first_array_in_data(response, { "animes", "response", "results" });
-                for (const std::string& object : json_object_array(results))
-                {
-                    animeId = first_string(object, { "id", "animeId", "aniId" });
-                    if (!animeId.empty()) break;
-                }
-                if (!animeId.empty()) break;
-                log_stage("HIANIME TITLE SEARCH HAD NO MATCH; trying next AniList title");
-            }
-            if (animeId.empty()) break;
-            if (!get("/api/v2/episodes/" + encode_url_component(animeId), response))
-                break;
-            episodes = parse_provider_episode_array(
-                first_array_in_data(response, { "episodes", "response" }));
-            break;
-        }
-        case ApiSourceId::AnimeKai:
-        {
-            const std::string base = "https://animekaitv.to";
-            std::string animePath, response;
-            for (const std::string& title : provider_search_titles(anime)) {
-                const std::string url = base + "/filter?keyword=" + encode_url_component(title) + "&page=1&vrf=" + ak_vrf_encrypt(title);
-                if (!http_request(url, nullptr, response, 20)) continue;
-                const std::string href = ak_first_href(response);
-                if (!href.empty()) { animePath = href; break; }
-            }
-            if (animePath.empty()) { status="AnimeKai search returned no matching show."; break; }
-            std::string detail;
-            const std::string detailUrl = base + animePath;
-            if (!http_request(detailUrl,nullptr,detail,20)) { status="AnimeKai detail request failed."; break; }
-            size_t idp=detail.find("data-id=");
-            std::string animeId=idp==std::string::npos?std::string():ak_attr(detail,idp,"data-id");
-            if(animeId.empty()){ size_t rp=detail.find("rate-box"); animeId=rp==std::string::npos?std::string():ak_attr(detail,rp,"data-id"); }
-            if(animeId.empty()){status="AnimeKai anime ID not found.";break;}
-            std::string frag;
-            const std::string epUrl=base+"/ajax/episode/list/"+animeId+"?vrf="+ak_vrf_encrypt(animeId);
-            std::vector<std::string> eh={"Accept: application/json, text/javascript, */*; q=0.01","Referer: "+detailUrl,"X-Requested-With: XMLHttpRequest"};
-            if(!http_request(epUrl,nullptr,response,20,nullptr,nullptr,&eh)){status="AnimeKai episode request failed.";break;}
-            frag=ak_result_html(response); episodes=ak_parse_episodes(frag,animePath); break;
-        }
-        case ApiSourceId::KickAssAnime:
-        {
-            static constexpr const char* kKaaBase = "https://kaa.lt";
-
-            // KickAssAnime's current native flow is JSON-based:
-            // POST /api/fsearch -> slug -> /api/show/{slug}
-            // -> /language -> /episodes?page=N&lang=...
-            std::string slug;
-
-            for (const std::string& title : provider_search_titles(anime))
-            {
-                const std::string searchUrl = std::string(kKaaBase) + "/api/fsearch";
-                const std::string body =
-                    std::string("{\"page\":1,\"query\":") + json_quote(title) + "}";
-                log_stage(("KAA SEARCH title=" + title).c_str());
-
-                if (!http_request(searchUrl, &body, response, 20))
-                    continue;
-
-                const std::string results = first_array(response, { "result" });
-                for (const std::string& object : json_object_array(results))
-                {
-                    slug = first_string(object, { "slug" });
-                    if (!slug.empty()) break;
-                }
-
-                if (!slug.empty())
-                    break;
-
-                log_stage("KAA SEARCH HAD NO MATCH; trying next AniList title");
-            }
-
-            if (slug.empty())
-            {
-                status = "KickAssAnime search returned no matching show.";
-                break;
-            }
-
-            {
-                const std::string showUrl =
-                    std::string(kKaaBase) + "/api/show/" + encode_url_component(slug);
-                if (!http_request(showUrl, nullptr, response, 20))
-                {
-                    status = "KickAssAnime show lookup failed.";
-                    break;
-                }
-                log_stage(("KAA SHOW READY slug=" + slug).c_str());
-            }
-
-            // Mirror AnikkuNX's language preference: Japanese first, English second.
-            std::string lang = "ja-JP";
-            {
-                const std::string languageUrl =
-                    std::string(kKaaBase) + "/api/show/" + encode_url_component(slug) + "/language";
-                if (http_request(languageUrl, nullptr, response, 20))
-                {
-                    const bool hasJapanese = response.find("ja-JP") != std::string::npos;
-                    const bool hasEnglish = response.find("en-US") != std::string::npos;
-                    if (hasJapanese)
-                        lang = "ja-JP";
-                    else if (hasEnglish)
-                        lang = "en-US";
-                    log_stage(("KAA LANGUAGE selected=" + lang).c_str());
-                }
-                else
-                {
-                    log_stage("KAA LANGUAGE REQUEST FAILED; trying ja-JP directly");
-                }
-            }
-
-            for (const char* candidate : { lang.c_str(), "ja-JP", "en-US" })
-            {
-                bool duplicate = false;
-                if (std::string(candidate) == "ja-JP" && lang == "ja-JP" && candidate != lang.c_str())
-                    duplicate = true;
-                if (std::string(candidate) == "en-US" && lang == "en-US" && candidate != lang.c_str())
-                    duplicate = true;
-                if (duplicate) continue;
-
-                episodes.clear();
-                bool pageFailed = false;
-                int pageCount = 1;
-
-                for (int page = 1; page <= pageCount; ++page)
-                {
-                    const std::string episodeUrl =
-                        std::string(kKaaBase) + "/api/show/" +
-                        encode_url_component(slug) + "/episodes?page=" +
-                        std::to_string(page) + "&lang=" + encode_url_component(candidate);
-
-                    char marker[192];
-                    std::snprintf(marker, sizeof(marker),
-                        "KAA EPISODES REQUEST page=%d lang=%s",
-                        page, candidate);
-                    log_stage(marker);
-
-                    if (!http_request(episodeUrl, nullptr, response, 20))
-                    {
-                        pageFailed = true;
-                        break;
-                    }
-
-                    const std::string result = first_array(response, { "result" });
-                    const std::vector<std::string> objects = json_object_array(result);
-                    if (page == 1)
-                    {
-                        const std::string pages = json_array_field(response, "pages");
-                        if (!pages.empty())
-                        {
-                            // KAA's \`pages\` field is an array; AnikkuNX uses
-                            // its element count as the number of episode pages.
-                            int discovered = 1;
-                            int depth = 0;
-                            bool inString = false;
-                            bool escaped = false;
-                            for (size_t pi = 1; pi + 1 < pages.size(); ++pi)
-                            {
-                                const char ch = pages[pi];
-                                if (inString)
-                                {
-                                    if (escaped) escaped = false;
-                                    else if (ch == '\\') escaped = true;
-                                    else if (ch == '"') inString = false;
-                                    continue;
-                                }
-                                if (ch == '"') inString = true;
-                                else if (ch == '[' || ch == '{') ++depth;
-                                else if (ch == ']' || ch == '}') --depth;
-                                else if (ch == ',' && depth == 0) ++discovered;
-                            }
-                            if (discovered > 0) pageCount = discovered;
-                        }
-                    }
-
-                    for (const std::string& object : objects)
-                    {
-                        const std::string numberText = first_string(
-                            object, { "episode_string", "episodeNumber", "episode" });
-                        const std::string episodeSlug = first_string(object, { "slug" });
-                        if (numberText.empty() || episodeSlug.empty())
-                            continue;
-
-                        ProviderEpisode item;
-                        item.number = std::atoi(numberText.c_str());
-                        if (item.number <= 0)
-                            continue;
-                        item.title = first_string(object, { "title" });
-                        if (item.title.empty())
-                            item.title = "Episode " + std::to_string(item.number);
-                        item.id = "/" + slug + "/ep-" + numberText + "-" + episodeSlug;
-                        item.provider = "KickAssAnime";
-                        item.category = candidate;
-                        episodes.push_back(std::move(item));
-                    }
-
-                    std::snprintf(marker, sizeof(marker),
-                        "KAA EPISODES PAGE DONE page=%d count=%zu totalPages=%d",
-                        page, objects.size(), pageCount);
-                    log_stage(marker);
-                }
-
-                if (!pageFailed && !episodes.empty())
-                    break;
-            }
-
-            std::stable_sort(episodes.begin(), episodes.end(),
-                [](const ProviderEpisode& a, const ProviderEpisode& b) {
-                    return a.number < b.number;
-                });
-
-            episodes.erase(std::unique(episodes.begin(), episodes.end(),
-                [](const ProviderEpisode& a, const ProviderEpisode& b) {
-                    return a.number == b.number && a.id == b.id;
-                }), episodes.end());
-
-            char marker[160];
-            std::snprintf(marker, sizeof(marker),
-                "KAA EPISODES FINAL count=%zu slug=%s",
-                episodes.size(), slug.c_str());
-            log_stage(marker);
-            break;
-        }
-        case ApiSourceId::Gogoanime:
-            return {};
-    }
-
-    if (!episodes.empty())
-    {
-        status = std::string(kApiSources[sourceId].name) + " returned " +
-            std::to_string(episodes.size()) + " episodes.";
-        char marker[160];
-        std::snprintf(marker, sizeof(marker), "EPISODE PROVIDER READY source=%d count=%zu",
-            sourceId, episodes.size());
-        log_stage(marker);
-        return episodes;
-    }
-
-    if (nonJsonResponseSeen)
-        status = std::string(kApiSources[sourceId].name) +
-            " URL returned a webpage, not scraper JSON. Set the deployed scraper API URL in Settings.";
-    else
-        status = std::string(kApiSources[sourceId].name) +
-            " scraper returned no episodes. Check its API route and network.";
-    log_stage(nonJsonResponseSeen
-        ? "EPISODE PROVIDER REJECTED NON-JSON WEBPAGE"
-        : "EPISODE PROVIDER REQUEST EMPTY OR FAILED");
-    return {};
 }
 
 static void clear_box(brls::Box* box)
@@ -1994,499 +709,6 @@ static void clear_box(brls::Box* box)
     for (brls::View* child : children)
         box->removeView(child);
 }
-
-
-class PlaybackPreviewActivity : public brls::Activity
-{
-public:
-    PlaybackPreviewActivity(SaikouAnime anime, int episode, int sourceId, std::string quality)
-        : m_anime(std::move(anime)), m_episode(episode), m_sourceId(sourceId), m_quality(std::move(quality))
-    {
-    }
-
-    brls::View* createContentView() override
-    {
-        brls::Box* root = new brls::Box(brls::Axis::COLUMN);
-        register_page_back_action(root);
-        root->setWidthPercentage(100.0f);
-        root->setHeightPercentage(100.0f);
-        root->setPadding(30.0f);
-        root->setBackgroundColor(nvgRGB(16, 20, 29));
-
-        brls::Label* heading = new brls::Label();
-        heading->setText("PLAYER");
-        heading->setFontSize(28.0f);
-        heading->setTextColor(nvgRGB(244, 246, 250));
-        root->addView(heading);
-
-        char episodeText[64];
-        std::snprintf(episodeText, sizeof(episodeText), "%s - Episode %d",
-            m_anime.title.c_str(), m_episode);
-        brls::Label* details = new brls::Label();
-        details->setText(episodeText);
-        details->setFontSize(17.0f);
-        details->setTextColor(nvgRGB(174, 184, 200));
-        details->setMargins(0, 5, 0, 0);
-        root->addView(details);
-
-        brls::Box* viewport = new brls::Box();
-        viewport->setDimensions(1160.0f, 470.0f);
-        viewport->setMargins(0, 18, 0, 0);
-        viewport->setBackgroundColor(nvgRGB(0, 0, 0));
-        viewport->setFocusable(false);
-        root->addView(viewport);
-
-        const std::string message =
-            "The player surface is ready for " + std::string(api_source_name(m_sourceId)) +
-            " at " + m_quality +
-            ". A stream URL and video playback backend are not connected yet.";
-        brls::Label* status = new brls::Label();
-        status->setText(message);
-        status->setFontSize(16.0f);
-        status->setLineHeight(22.0f);
-        status->setTextColor(nvgRGB(174, 184, 200));
-        status->setMargins(0, 12, 0, 0);
-        status->setFocusable(false);
-        root->addView(status);
-
-        brls::Label* back = new brls::Label();
-        back->setText("Press B to return to episode selection.");
-        back->setFontSize(14.0f);
-        back->setTextColor(nvgRGB(135, 147, 166));
-        back->setMargins(0, 12, 0, 0);
-        back->setFocusable(false);
-        root->addView(back);
-        return root;
-    }
-
-private:
-    SaikouAnime m_anime;
-    int m_episode = 0;
-    int m_sourceId = 0;
-    std::string m_quality;
-};
-
-class EpisodeStreamActivity;
-static EpisodeStreamActivity* g_episodeStreamActivity = nullptr;
-
-class EpisodeStreamActivity : public brls::Activity
-{
-public:
-    EpisodeStreamActivity(SaikouAnime anime, ProviderEpisode episode, int sourceId)
-        : m_anime(std::move(anime)), m_providerEpisode(std::move(episode)), m_sourceId(sourceId)
-    {
-        g_episodeStreamActivity = this;
-    }
-
-    ~EpisodeStreamActivity() override
-    {
-        m_lifetime->store(false, std::memory_order_release);
-        if (m_worker.joinable()) m_worker.join();
-        if (g_episodeStreamActivity == this) g_episodeStreamActivity = nullptr;
-    }
-
-    brls::View* createContentView() override
-    {
-        brls::Box* root = new brls::Box(brls::Axis::COLUMN);
-        register_page_back_action(root);
-        root->setWidthPercentage(100.0f);
-        root->setHeightPercentage(100.0f);
-        root->setPadding(30.0f);
-        root->setBackgroundColor(nvgRGB(16, 20, 29));
-
-        brls::Label* heading = new brls::Label();
-        heading->setText(m_providerEpisode.title);
-        heading->setFontSize(28.0f);
-        heading->setTextColor(nvgRGB(244, 246, 250));
-        root->addView(heading);
-
-        brls::Label* animeTitle = new brls::Label();
-        animeTitle->setText(m_anime.title);
-        animeTitle->setFontSize(18.0f);
-        animeTitle->setTextColor(nvgRGB(174, 184, 200));
-        animeTitle->setMargins(0, 5, 0, 0);
-        root->addView(animeTitle);
-
-        m_sourceStatus = new brls::Label();
-        m_sourceStatus->setFontSize(15.0f);
-        m_sourceStatus->setLineHeight(21.0f);
-        m_sourceStatus->setTextColor(nvgRGB(174, 184, 200));
-        m_sourceStatus->setMargins(0, 16, 0, 0);
-        m_sourceStatus->setFocusable(false);
-        if (m_sourceId == static_cast<int>(ApiSourceId::KickAssAnime) ||
-            m_sourceId == static_cast<int>(ApiSourceId::AnimeKai))
-        {
-            m_sourceStatus->setText(
-                "Loading available sources from " +
-                std::string(api_source_name(m_sourceId)) + "...");
-        }
-        else
-        {
-            m_sourceStatus->setText("Source extraction for this provider is not connected yet.");
-        }
-        root->addView(m_sourceStatus);
-
-        // While source extraction runs, trap focus inside this activity.
-        m_focusSink = new brls::Padding();
-        m_focusSink->setWidth(1.0f);
-        m_focusSink->setHeight(1.0f);
-        m_focusSink->alpha = 0.0f;
-        m_focusSink->setFocusable(true);
-        root->addView(m_focusSink);
-
-        m_streamRow = new brls::Box(brls::Axis::ROW);
-        m_streamRow->setWidthPercentage(100.0f);
-        m_streamRow->setHeight(70.0f);
-        m_streamRow->setMargins(0, 12, 0, 0);
-        root->addView(m_streamRow);
-
-        brls::Label* playerStatus = new brls::Label();
-        playerStatus->setText(
-            "Select a stream with A to start native playback. Press B to return.");
-        playerStatus->setFontSize(14.0f);
-        playerStatus->setTextColor(nvgRGB(135, 147, 166));
-        playerStatus->setMargins(0, 18, 0, 0);
-        playerStatus->setFocusable(false);
-        root->addView(playerStatus);
-
-        if (m_sourceId == static_cast<int>(ApiSourceId::KickAssAnime) ||
-            m_sourceId == static_cast<int>(ApiSourceId::AnimeKai))
-            start_load();
-        brls::Application::giveFocus(m_focusSink);
-        return root;
-    }
-
-    void tick()
-    {
-        if (!m_ready.load(std::memory_order_acquire)) return;
-        if (m_worker.joinable()) m_worker.join();
-        m_ready.store(false, std::memory_order_release);
-        if (m_sourceStatus) m_sourceStatus->setText(m_statusText);
-        clear_box(m_streamRow);
-        m_streamChoices.clear();
-        if (m_streams.empty())
-        {
-            // Do not render an unfocusable fake button. The status label above is the
-            // authoritative result of extraction, and the invisible sink keeps focus
-            // from leaking back into the episode list underneath.
-            if (m_focusSink)
-                m_focusSink->setFocusable(true);
-            return;
-        }
-
-        if (m_focusSink)
-            m_focusSink->setFocusable(false);
-
-        for (size_t i = 0; i < m_streams.size(); ++i)
-        {
-            const ProviderStream& stream = m_streams[i];
-            const std::string label =
-                (stream.quality.empty() ? std::string("Stream") : stream.quality) +
-                (stream.type.empty() ? std::string() : "  " + stream.type);
-            brls::Box* choice = make_option(label, i == m_selectedStream);
-            choice->registerAction("Play scraper stream option", brls::BUTTON_A,
-                [this, i, label](brls::View*) {
-                    m_selectedStream = i;
-                    const ProviderStream& selected = m_streams[m_selectedStream];
-                    log_stage("NATIVE PLAYER OPEN: selected scraper stream");
-                    brls::Application::pushActivity(
-                        new SaikouMpvPlayerActivity(
-                            m_anime.title,
-                            m_providerEpisode.title,
-                            label,
-                            selected.url,
-                            selected.headers),
-                        brls::TransitionAnimation::NONE);
-                    return true;
-                });
-            m_streamChoices.push_back(choice);
-            m_streamRow->addView(choice);
-        }
-        if (!m_streamChoices.empty())
-            brls::Application::giveFocus(m_streamChoices[0]);
-    }
-
-private:
-    SaikouAnime m_anime;
-    ProviderEpisode m_providerEpisode;
-    int m_sourceId = 0;
-    size_t m_selectedStream = 0;
-    brls::Box* m_streamRow = nullptr;
-    brls::Label* m_sourceStatus = nullptr;
-    std::vector<brls::Box*> m_streamChoices;
-    std::vector<ProviderStream> m_streams;
-    std::string m_statusText;
-    brls::Padding* m_focusSink = nullptr;
-    std::thread m_worker;
-    std::atomic<bool> m_ready{ false };
-    std::shared_ptr<std::atomic<bool>> m_lifetime =
-        std::make_shared<std::atomic<bool>>(true);
-
-    brls::Box* make_option(const std::string& text, bool selected)
-    {
-        brls::Box* option = new brls::Box(brls::Axis::COLUMN);
-        option->setWidth(210.0f);
-        option->setHeight(58.0f);
-        option->setMargins(0, 0, 9, 0);
-        option->setPadding(9.0f);
-        option->setBackgroundColor(selected ? nvgRGB(31, 64, 79) : nvgRGB(27, 34, 48));
-        option->setBorderColor(selected ? nvgRGB(67, 190, 218) : nvgRGB(48, 57, 74));
-        option->setBorderThickness(selected ? 2.0f : 1.0f);
-        option->setCornerRadius(8.0f);
-        option->setFocusable(true);
-        brls::Label* label = new brls::Label();
-        label->setText(text);
-        label->setFontSize(15.0f);
-        label->setTextColor(nvgRGB(244, 246, 250));
-        label->setFocusable(false);
-        option->addView(label);
-        return option;
-    }
-
-    void start_load()
-    {
-        const auto lifetime = m_lifetime;
-        const ProviderEpisode episode = m_providerEpisode;
-        m_worker = std::thread([this, lifetime, episode] {
-            if (m_sourceId == static_cast<int>(ApiSourceId::AnimeKai))
-            {
-                perf_log("ANIMEKAI SOURCE REQUEST START");
-                m_streams = fetch_animekai_sources(episode, m_statusText);
-            }
-            else if (m_sourceId == static_cast<int>(ApiSourceId::KickAssAnime))
-            {
-                perf_log("KAA SOURCE REQUEST START");
-                m_streams = fetch_kaa_sources(episode, m_statusText);
-            }
-            else
-            {
-                perf_log("MIRURO STREAM REQUEST START");
-                m_streams = fetch_miruro_streams(episode, m_statusText);
-            }
-            if (!lifetime->load(std::memory_order_acquire)) return;
-            m_ready.store(true, std::memory_order_release);
-        });
-    }
-};
-
-class EpisodeListActivity;
-static EpisodeListActivity* g_episodeListActivity = nullptr;
-
-class EpisodeListActivity : public brls::Activity
-{
-public:
-    EpisodeListActivity(SaikouAnime anime, int sourceId)
-        : m_anime(std::move(anime)), m_sourceId(sourceId)
-    {
-        g_episodeListActivity = this;
-    }
-
-    ~EpisodeListActivity() override
-    {
-        m_lifetime->store(false, std::memory_order_release);
-        if (m_worker.joinable()) m_worker.join();
-        if (g_episodeListActivity == this) g_episodeListActivity = nullptr;
-    }
-
-    brls::View* createContentView() override
-    {
-        m_content = new brls::Box(brls::Axis::COLUMN);
-        register_page_back_action(m_content);
-        m_content->setWidthPercentage(100.0f);
-        m_content->setHeightPercentage(100.0f);
-        m_content->setPadding(30.0f);
-        m_content->setBackgroundColor(nvgRGB(16, 20, 29));
-
-        brls::Label* heading = new brls::Label();
-        heading->setText("EPISODES");
-        heading->setFontSize(28.0f);
-        heading->setTextColor(nvgRGB(244, 246, 250));
-        m_content->addView(heading);
-
-        brls::Label* animeTitle = new brls::Label();
-        animeTitle->setText(m_anime.title);
-        animeTitle->setFontSize(17.0f);
-        animeTitle->setTextColor(nvgRGB(174, 184, 200));
-        animeTitle->setMargins(0, 4, 0, 0);
-        m_content->addView(animeTitle);
-
-        m_status = new brls::Label();
-        m_status->setFontSize(14.0f);
-        m_status->setTextColor(nvgRGB(135, 147, 166));
-        m_status->setMargins(0, 8, 0, 0);
-        m_status->setFocusable(false);
-        m_content->addView(m_status);
-
-        // Keep focus inside this activity while the async provider request is running.
-        // Otherwise Borealis can fall back to the previous activity's focused provider buttons.
-        m_focusSink = new brls::Padding();
-        m_focusSink->setWidth(1.0f);
-        m_focusSink->setHeight(1.0f);
-        m_focusSink->alpha = 0.0f;
-        m_focusSink->setFocusable(true);
-        m_content->addView(m_focusSink);
-
-        m_scroll = new brls::ScrollingFrame();
-        m_scroll->setWidthPercentage(100.0f);
-        m_scroll->setGrow(1.0f);
-        m_scroll->setMargins(0, 10, 0, 0);
-        m_scroll->setScrollingBehavior(brls::ScrollingBehavior::NATURAL);
-        m_rows = new brls::Box(brls::Axis::COLUMN);
-        m_rows->setWidth(1160.0f);
-        m_rows->setHeight(600.0f);
-        m_scroll->setContentView(m_rows);
-        m_content->addView(m_scroll);
-
-        m_status->setText("Loading episode list from " + std::string(api_source_name(m_sourceId)) + "...");
-        start_load();
-        brls::Application::giveFocus(m_focusSink);
-        return m_content;
-    }
-
-    void tick()
-    {
-        if (!m_ready.load(std::memory_order_acquire))
-            return;
-        if (m_worker.joinable()) m_worker.join();
-        m_ready.store(false, std::memory_order_release);
-        if (m_status) m_status->setText(m_statusText);
-
-        clear_box(m_rows);
-        if (m_focusSink)
-            m_focusSink->setFocusable(false);
-        if (m_episodes.empty())
-        {
-            brls::Box* back = new brls::Box(brls::Axis::ROW);
-            back->setWidth(300.0f);
-            back->setHeight(56.0f);
-            back->setMargins(0, 18, 0, 0);
-            back->setPadding(12.0f);
-            back->setAlignItems(brls::AlignItems::CENTER);
-            back->setBackgroundColor(nvgRGB(27, 34, 48));
-            back->setBorderColor(nvgRGB(48, 57, 74));
-            back->setBorderThickness(1.0f);
-            back->setCornerRadius(8.0f);
-            back->setFocusable(true);
-            brls::Label* backLabel = new brls::Label();
-            backLabel->setText("BACK TO ANIME");
-            backLabel->setFontSize(16.0f);
-            backLabel->setTextColor(nvgRGB(244, 246, 250));
-            backLabel->setFocusable(false);
-            back->addView(backLabel);
-            back->registerAction("Return to anime details", brls::BUTTON_A, [](brls::View*) {
-                brls::sync([] {
-                    brls::Application::popActivity(brls::TransitionAnimation::NONE, [] {}, true);
-                });
-                return true;
-            });
-            m_rows->addView(back);
-            brls::Application::giveFocus(back);
-            return;
-        }
-
-        for (size_t begin = 0; begin < m_episodes.size(); begin += 50)
-        {
-            const size_t finish = std::min(begin + 50, m_episodes.size());
-            const size_t batch = finish - begin;
-            brls::Label* rowHeading = new brls::Label();
-            rowHeading->setText("EPISODES " + std::to_string(begin + 1) +
-                "–" + std::to_string(finish));
-            rowHeading->setFontSize(17.0f);
-            rowHeading->setTextColor(nvgRGB(220, 228, 240));
-            rowHeading->setFocusable(false);
-            rowHeading->setMargins(0, begin == 0 ? 0 : 12, 0, 0);
-            m_rows->addView(rowHeading);
-
-            brls::HScrollingFrame* horizontal = new brls::HScrollingFrame();
-            horizontal->setWidth(1160.0f);
-            horizontal->setHeight(70.0f);
-            horizontal->setMargins(0, 5, 0, 0);
-            horizontal->setScrollingBehavior(brls::ScrollingBehavior::NATURAL);
-            brls::Box* row = new brls::Box(brls::Axis::ROW);
-            row->setWidth(std::max(1160.0f, static_cast<float>(batch) * 190.0f));
-            row->setHeight(62.0f);
-            for (size_t i = begin; i < finish; ++i)
-            {
-                const ProviderEpisode& episode = m_episodes[i];
-                brls::Box* tile = new brls::Box(brls::Axis::COLUMN);
-                tile->setWidth(182.0f);
-                tile->setHeight(54.0f);
-                tile->setPadding(8.0f);
-                tile->setMargins(0, 0, 8, 0);
-                tile->setBackgroundColor(nvgRGB(27, 34, 48));
-                tile->setBorderColor(nvgRGB(48, 57, 74));
-                tile->setBorderThickness(1.0f);
-                tile->setCornerRadius(7.0f);
-                tile->setFocusable(true);
-                brls::Label* label = new brls::Label();
-                std::string episodeLabel = "Episode " + std::to_string(episode.number);
-                if (!episode.provider.empty())
-                    episodeLabel += "  " + episode.provider;
-                if (!episode.category.empty())
-                    episodeLabel += "  " + episode.category;
-                if (!episode.title.empty() && episode.title != "Episode " + std::to_string(episode.number))
-                    episodeLabel += " — " + episode.title;
-                label->setText(episodeLabel);
-                label->setFontSize(15.0f);
-                label->setTextColor(nvgRGB(244, 246, 250));
-                label->setFocusable(false);
-                tile->addView(label);
-                tile->registerAction("Select provider episode", brls::BUTTON_A,
-                    [this, episode](brls::View*) {
-                        log_stage("EPISODE SELECTED FROM PROVIDER");
-                        brls::Application::pushActivity(
-                            new EpisodeStreamActivity(m_anime, episode, m_sourceId),
-                            brls::TransitionAnimation::NONE);
-                        return true;
-                    });
-                row->addView(tile);
-            }
-            row->setDefaultFocusedIndex(0);
-            horizontal->setContentView(row);
-            m_rows->addView(horizontal);
-        }
-
-        m_rows->setHeight(std::max(600.0f,
-            static_cast<float>((m_episodes.size() + 49) / 50) * 112.0f + 80.0f));
-        if (m_episodes.size() && m_rows)
-        {
-            m_rows->setDefaultFocusedIndex(1);
-            if (m_rows->getDefaultFocus())
-                brls::Application::giveFocus(m_rows->getDefaultFocus());
-        }
-        perf_log_count("PROVIDER EPISODE TILES RENDERED", m_episodes.size());
-    }
-
-private:
-    SaikouAnime m_anime;
-    int m_sourceId = 0;
-    brls::Box* m_content = nullptr;
-    brls::Label* m_status = nullptr;
-    brls::ScrollingFrame* m_scroll = nullptr;
-    brls::Box* m_rows = nullptr;
-    std::thread m_worker;
-    std::atomic<bool> m_ready{ false };
-    std::shared_ptr<std::atomic<bool>> m_lifetime =
-        std::make_shared<std::atomic<bool>>(true);
-    std::vector<ProviderEpisode> m_episodes;
-    std::string m_statusText;
-    brls::Padding* m_focusSink = nullptr;
-
-    void start_load()
-    {
-        if (m_worker.joinable()) m_worker.join();
-        m_ready.store(false, std::memory_order_release);
-        const auto lifetime = m_lifetime;
-        const SaikouAnime anime = m_anime;
-        const int sourceId = m_sourceId;
-        m_worker = std::thread([this, lifetime, anime, sourceId] {
-            perf_log("PROVIDER EPISODE REQUEST START");
-            m_episodes = fetch_provider_episodes(anime, sourceId, m_statusText);
-            if (!lifetime->load(std::memory_order_acquire)) return;
-            m_ready.store(true, std::memory_order_release);
-        });
-    }
-};
 
 class AnimeDetailsActivity;
 static AnimeDetailsActivity* g_animeDetailsActivity = nullptr;
@@ -2537,8 +759,8 @@ public:
             meta = "AniList score " + std::to_string(anime.score) + "/100";
         if (!anime.format.empty())
             meta += (meta.empty() ? "" : "    ") + anime.format;
-        // AniList episode counts are metadata only and can be absent for long-running series.
-        // Episode rows must be populated by the selected streaming provider.
+        if (anime.episodes > 0)
+            meta += (meta.empty() ? "" : "    ") + std::to_string(anime.episodes) + " episodes";
 
         brls::Label* metaLabel = new brls::Label();
         metaLabel->setText(meta);
@@ -2630,7 +852,7 @@ public:
         m_sourceStatus->setFontSize(14.0f);
         m_sourceStatus->setTextColor(nvgRGB(174, 184, 200));
         m_sourceStatus->setMargins(0, 7, 0, 0);
-        m_sourceStatus->setText("Choose a provider. Episode and stream lookup are not connected in this build yet.");
+        m_sourceStatus->setText("Choose a source. Episode lookup and playback are the next integration step.");
         root->addView(m_sourceStatus);
     }
 
@@ -2689,10 +911,7 @@ private:
                 g_selectedApiSource = id;
                 save_source_settings();
                 if (m_sourceStatus)
-                    m_sourceStatus->setText("Selected " + name + ". Opening episode list.");
-                brls::Application::pushActivity(
-                    new EpisodeListActivity(anime, id),
-                    brls::TransitionAnimation::NONE);
+                    m_sourceStatus->setText("Selected " + name + ". Episode lookup is being connected.");
                 log_stage("DETAIL SOURCE SELECTED");
                 return true;
             });
@@ -2702,10 +921,8 @@ private:
 
 static void open_anime_details(const SaikouAnime& anime)
 {
-    char marker[128];
-    const auto stack = brls::Application::getActivitiesStack();
-    std::snprintf(marker, sizeof(marker),
-        "ANIME CARD OPENED: id=%d stack_before=%zu", anime.id, stack.size());
+    char marker[96];
+    std::snprintf(marker, sizeof(marker), "ANIME CARD OPENED: id=%d", anime.id);
     log_stage(marker);
     brls::Application::pushActivity(
         new AnimeDetailsActivity(anime),
@@ -2721,10 +938,7 @@ static std::string compact_card_title(const std::string& title)
     return title.substr(0, cut) + "...";
 }
 
-static brls::Box* make_anime_card(
-    const SaikouAnime& anime,
-    const std::string& subtitle = std::string(),
-    brls::Image** imageOut = nullptr)
+static brls::Box* make_anime_card(const SaikouAnime& anime, const std::string& subtitle = std::string())
 {
     brls::Box* card = new brls::Box(brls::Axis::COLUMN);
     card->setWidth(184.0f);
@@ -2738,25 +952,26 @@ static brls::Box* make_anime_card(
     card->setFocusable(true);
     card->setHighlightPadding(4.0f);
 
-    const std::string imagePath = anime.posterPath.empty()
-        ? cached_cover_path(anime.id)
-        : anime.posterPath;
+    const std::string imagePath = anime.posterPath.empty() ? cached_cover_path(anime.id) : anime.posterPath;
     struct stat st;
     const float posterHeight = subtitle.empty() ? 168.0f : 148.0f;
-
-    brls::Image* poster = new brls::Image();
-    poster->setDimensions(168.0f, posterHeight);
-    poster->setScalingType(brls::ImageScalingType::FIT);
-    poster->setBackgroundColor(nvgRGB(35, 45, 62));
-    poster->setFocusable(false);
-
     if (stat(imagePath.c_str(), &st) == 0 && st.st_size > 256)
+    {
+        brls::Image* poster = new brls::Image();
+        poster->setDimensions(168.0f, posterHeight);
+        poster->setScalingType(brls::ImageScalingType::FIT);
         poster->setImageFromFile(imagePath);
-
-    if (imageOut)
-        *imageOut = poster;
-
-    card->addView(poster);
+        poster->setFocusable(false);
+        card->addView(poster);
+    }
+    else
+    {
+        brls::Box* placeholder = new brls::Box();
+        placeholder->setDimensions(168.0f, posterHeight);
+        placeholder->setBackgroundColor(nvgRGB(35, 45, 62));
+        placeholder->setFocusable(false);
+        card->addView(placeholder);
+    }
 
     brls::Label* score = new brls::Label();
     score->setText(anime.score > 0 ? "AniList  " + std::to_string(anime.score) + "/100" : "AniList score unavailable");
@@ -2793,37 +1008,6 @@ static brls::Box* make_anime_card(
     return card;
 }
 
-static void render_horizontal_anime_cards(brls::Box* container, const std::vector<SaikouAnime>& items)
-{
-    if (!container) return;
-    clear_box(container);
-
-    // Keep the HScrollingFrame content view wide enough to contain the complete
-    // card footprint, including its horizontal margins, so the final card remains
-    // reachable by focus/navigation.
-    const float contentWidth = std::max(1160.0f, static_cast<float>(items.size()) * 192.0f);
-    container->setWidth(contentWidth);
-
-    brls::Box* row = new brls::Box(brls::Axis::ROW);
-    row->setWidth(contentWidth);
-    row->setHeight(252.0f);
-    row->setAlignItems(brls::AlignItems::FLEX_START);
-
-    for (const SaikouAnime& anime : items)
-        row->addView(make_anime_card(anime));
-
-    container->addView(row);
-
-    if (items.empty())
-    {
-        brls::Label* empty = new brls::Label();
-        empty->setText("No titles to show.");
-        empty->setFontSize(16.0f);
-        empty->setTextColor(nvgRGB(174, 184, 200));
-        row->addView(empty);
-    }
-}
-
 static void render_anime_cards(brls::Box* container, const std::vector<SaikouAnime>& items)
 {
     if (!container) return;
@@ -2852,11 +1036,6 @@ static void render_anime_cards(brls::Box* container, const std::vector<SaikouAni
     }
 }
 
-// Shared by Search, Trending, Currently Airing, and Continue Watching.
-// Keep the implementation below the activity definitions, but declare it here
-// so earlier activity classes can safely reference the shared Load More UI.
-static brls::Box* make_home_load_more_card(std::function<void()> callback);
-
 class SearchActivity;
 static SearchActivity* g_searchActivity = nullptr;
 
@@ -2867,11 +1046,8 @@ public:
 
     ~SearchActivity() override
     {
-        m_lifetime->store(false, std::memory_order_release);
         if (m_worker.joinable())
             m_worker.join();
-        if (m_imageWorker.joinable())
-            m_imageWorker.join();
         if (g_searchActivity == this)
             g_searchActivity = nullptr;
     }
@@ -2891,26 +1067,26 @@ public:
         heading->setFontSize(28.0f);
         root->addView(heading);
 
-        m_searchButton = new brls::Box(brls::Axis::ROW);
-        m_searchButton->setWidth(500.0f);
-        m_searchButton->setHeight(52.0f);
-        m_searchButton->setMargins(0, 15, 0, 0);
-        m_searchButton->setPadding(12.0f);
-        m_searchButton->setBackgroundColor(nvgRGB(27, 34, 48));
-        m_searchButton->setBorderColor(nvgRGB(48, 57, 74));
-        m_searchButton->setBorderThickness(1.0f);
-        m_searchButton->setCornerRadius(8.0f);
-        m_searchButton->setFocusable(true);
+        brls::Box* searchButton = new brls::Box(brls::Axis::ROW);
+        searchButton->setWidth(500.0f);
+        searchButton->setHeight(52.0f);
+        searchButton->setMargins(0, 15, 0, 0);
+        searchButton->setPadding(12.0f);
+        searchButton->setBackgroundColor(nvgRGB(27, 34, 48));
+        searchButton->setBorderColor(nvgRGB(48, 57, 74));
+        searchButton->setBorderThickness(1.0f);
+        searchButton->setCornerRadius(8.0f);
+        searchButton->setFocusable(true);
 
         m_queryLabel = new brls::Label();
         m_queryLabel->setText("Press A to enter a title with the Switch keyboard");
         m_queryLabel->setFontSize(16.0f);
-        m_searchButton->addView(m_queryLabel);
-        m_searchButton->registerAction("Enter search query", brls::BUTTON_A, [this](brls::View*) {
+        searchButton->addView(m_queryLabel);
+        searchButton->registerAction("Enter search query", brls::BUTTON_A, [this](brls::View*) {
             run_search();
             return true;
         });
-        root->addView(m_searchButton);
+        root->addView(searchButton);
 
         m_status = new brls::Label();
         m_status->setText("Search uses live AniList anime data.");
@@ -2919,18 +1095,10 @@ public:
         m_status->setMargins(0, 12, 0, 0);
         root->addView(m_status);
 
-        m_scroll = new brls::ScrollingFrame();
-        m_scroll->setWidthPercentage(100.0f);
-        m_scroll->setHeight(575.0f);
-        m_scroll->setMargins(0, 12, 0, 0);
-        m_scroll->setScrollingBehavior(brls::ScrollingBehavior::NATURAL);
-
         m_results = new brls::Box(brls::Axis::COLUMN);
-        m_results->setWidth(1160.0f);
-        m_results->setHeight(600.0f);
-        m_scroll->setContentView(m_results);
-        root->addView(m_scroll);
-
+        m_results->setWidthPercentage(100.0f);
+        m_results->setMargins(0, 12, 0, 0);
+        root->addView(m_results);
         log_stage("SEARCH VIEW BUILT");
         return root;
     }
@@ -2939,90 +1107,60 @@ public:
     {
         if (!m_resultReady.load(std::memory_order_acquire))
             return;
-
         if (m_worker.joinable())
             m_worker.join();
-
-        m_loading = false;
-        m_resultReady.store(false, std::memory_order_release);
-
-        ++m_renderGeneration;
-        render_results();
-        perf_log_count("SEARCH FIRST VISIBLE CARDS RENDERED", m_resultItems.size());
-        start_progressive_image_load();
-
+        render_anime_cards(m_results, m_resultItems);
         if (m_status)
-        {
-            std::string text = m_resultStatus;
-            text += " — " + std::to_string(m_resultItems.size()) +
-                " results";
-            if (m_hasMore)
-                text += " — select LOAD MORE for another 24.";
-            m_status->setText(text);
-        }
-
+            m_status->setText(m_resultStatus + " — press A on a title for details.");
+        m_searching = false;
+        m_resultReady.store(false, std::memory_order_release);
         log_stage("SEARCH RESULTS ATTACHED");
     }
 
 private:
     brls::Label* m_queryLabel = nullptr;
-    brls::Box* m_searchButton = nullptr;
     brls::Label* m_status = nullptr;
-    brls::ScrollingFrame* m_scroll = nullptr;
     brls::Box* m_results = nullptr;
-
     std::string m_pendingQuery;
     std::string m_resultStatus;
     std::vector<SaikouAnime> m_resultItems;
     std::thread m_worker;
-    std::thread m_imageWorker;
     std::atomic<bool> m_resultReady{ false };
-    std::atomic<uint64_t> m_renderGeneration{ 0 };
-    std::shared_ptr<std::atomic<bool>> m_lifetime =
-        std::make_shared<std::atomic<bool>>(true);
-
-    bool m_loading = false;
-    bool m_hasMore = true;
-    int m_page = 0;
+    bool m_searching = false;
 
     void run_search()
     {
-        if (m_loading)
+        if (m_searching)
         {
-            if (m_status)
-                m_status->setText("Search is still loading. Please wait.");
+            if (m_status) m_status->setText("Search is still loading. Please wait.");
             return;
         }
 
         log_stage("SEARCH SWITCH KEYBOARD OPEN");
-
         SwkbdConfig keyboard{};
         Result rc = swkbdCreate(&keyboard, 0);
         if (R_FAILED(rc))
         {
-            if (m_status)
-                m_status->setText("Could not open the Switch keyboard.");
+            if (m_status) m_status->setText("Could not open the Switch keyboard.");
             log_stage("SEARCH SWITCH KEYBOARD CREATE FAILED");
             return;
         }
-
         swkbdConfigMakePresetDefault(&keyboard);
         swkbdConfigSetHeaderText(&keyboard, "Search anime on AniList");
         swkbdConfigSetGuideText(&keyboard, "Type an anime title");
         swkbdConfigSetSubText(&keyboard, "Press Search to run the query; Cancel closes the keyboard");
         swkbdConfigSetOkButtonText(&keyboard, "Search");
-
         if (!m_pendingQuery.empty())
             swkbdConfigSetInitialText(&keyboard, m_pendingQuery.c_str());
 
+        // The system keyboard owns input while it is open. Keep Borealis from
+        // treating the same + press as the app-wide quit shortcut on return.
         brls::Application::setGlobalQuit(false);
         g_restoreGlobalQuitAfterKeyboard = true;
         log_stage("SEARCH KEYBOARD GLOBAL QUIT DISABLED");
-
         char query[256] = {};
         rc = swkbdShow(&keyboard, query, sizeof(query));
         swkbdClose(&keyboard);
-
         if (R_FAILED(rc) || query[0] == '\0')
         {
             if (m_status)
@@ -3033,219 +1171,25 @@ private:
 
         if (m_worker.joinable())
             m_worker.join();
-
         m_pendingQuery = query;
-        m_page = 1;
-        m_hasMore = true;
-        ++m_renderGeneration;
-        if (m_imageWorker.joinable())
-            m_imageWorker.join();
-        m_resultItems.clear();
-
-        if (m_queryLabel)
-            m_queryLabel->setText(m_pendingQuery);
-        if (m_status)
-            m_status->setText("Searching AniList...");
+        if (m_queryLabel) m_queryLabel->setText(m_pendingQuery);
+        if (m_status) m_status->setText("Searching AniList...");
         clear_box(m_results);
-
-        m_loading = true;
+        m_searching = true;
         m_resultReady.store(false, std::memory_order_release);
         log_stage("SEARCH REQUEST STARTED");
-
-        start_load_page(1);
-    }
-
-    void start_load_page(int page)
-    {
-        if (m_loading && page != 1)
-            return;
-        if (page != 1 && !m_hasMore)
-            return;
-
-        if (m_worker.joinable())
-            m_worker.join();
-
-        m_loading = true;
-        m_resultReady.store(false, std::memory_order_release);
-        m_page = page;
-
-        if (m_status)
-            m_status->setText(page == 1
-                ? "Searching AniList..."
-                : "Loading more search results...");
-
-        m_worker = std::thread([this, page] {
-            char stage[96];
-            std::snprintf(stage, sizeof(stage), "SEARCH PAGE %d API START", page);
-            perf_log(stage);
-
-            std::string status;
-            std::vector<SaikouAnime> newItems =
-                fetch_anilist_media(m_pendingQuery, 24, status, page);
-            std::snprintf(stage, sizeof(stage), "SEARCH PAGE %d METADATA RECEIVED", page);
-            perf_log_count(stage, newItems.size());
-
-            for (SaikouAnime& anime : newItems)
+        m_worker = std::thread([this] {
+            m_resultItems = fetch_anilist_media(m_pendingQuery, 12, m_resultStatus);
+            for (SaikouAnime& anime : m_resultItems)
+            {
                 anime.posterPath = cached_cover_path(anime.id);
-
-            if (newItems.size() < 24)
-                m_hasMore = false;
-
-            m_resultItems.insert(m_resultItems.end(), newItems.begin(), newItems.end());
+                if (!download_image(anime.coverUrl, anime.posterPath))
+                    anime.posterPath.clear();
+            }
             m_resultReady.store(true, std::memory_order_release);
         });
     }
-
-    void start_progressive_image_load()
-    {
-        if (m_imageWorker.joinable())
-            m_imageWorker.join();
-
-        if (m_resultItems.empty() || !m_results)
-            return;
-
-        std::vector<brls::Image*> posters;
-        posters.reserve(m_resultItems.size());
-
-        for (brls::View* rowView : m_results->getChildren())
-        {
-            brls::Box* row = dynamic_cast<brls::Box*>(rowView);
-            if (!row) continue;
-
-            for (brls::View* cardView : row->getChildren())
-            {
-                brls::Box* card = dynamic_cast<brls::Box*>(cardView);
-                if (!card) continue;
-
-                const auto children = card->getChildren();
-                if (children.empty()) continue;
-
-                brls::Image* poster =
-                    dynamic_cast<brls::Image*>(children.front());
-                if (poster && posters.size() < m_resultItems.size())
-                    posters.push_back(poster);
-            }
-        }
-
-        // The final row contains the Load More card, which has no poster Image,
-        // so only the anime-card image slots should have been collected.
-        if (posters.size() != m_resultItems.size())
-        {
-            perf_log_count("SEARCH PROGRESSIVE IMAGE SLOT MISMATCH", posters.size());
-            return;
-        }
-
-        const uint64_t generation =
-            m_renderGeneration.load(std::memory_order_acquire);
-        const auto lifetime = m_lifetime;
-        const std::vector<SaikouAnime> items = m_resultItems;
-
-        perf_log_count("SEARCH PROGRESSIVE IMAGE LOAD START", items.size());
-
-        m_imageWorker = std::thread(
-            [this, lifetime, generation, items, posters] {
-                size_t completed = 0;
-
-                for (size_t index = 0; index < items.size(); ++index)
-                {
-                    if (!lifetime->load(std::memory_order_acquire))
-                        return;
-                    if (m_renderGeneration.load(std::memory_order_acquire) != generation)
-                        return;
-
-                    const SaikouAnime& anime = items[index];
-                    const std::string path = cached_cover_path(anime.id);
-
-                    if (!download_image(anime.coverUrl, path))
-                        continue;
-
-                    ++completed;
-                    brls::sync([this, lifetime, generation,
-                        poster = posters[index], path, completed] {
-                        if (!lifetime->load(std::memory_order_acquire))
-                            return;
-                        if (m_renderGeneration.load(std::memory_order_acquire) != generation)
-                            return;
-
-                        poster->setImageFromFile(path);
-
-                        char stage[128];
-                        std::snprintf(stage, sizeof(stage),
-                            "SEARCH PROGRESSIVE IMAGE READY %zu", completed);
-                        perf_log(stage);
-                    });
-                }
-
-                brls::sync([this, lifetime, generation, completed] {
-                    if (!lifetime->load(std::memory_order_acquire))
-                        return;
-                    if (m_renderGeneration.load(std::memory_order_acquire) != generation)
-                        return;
-
-                    perf_log_count(
-                        "SEARCH PROGRESSIVE IMAGE LOAD DONE", completed);
-                });
-            });
-    }
-
-    brls::Box* make_search_load_more_card()
-    {
-        return make_home_load_more_card([this] {
-            remove_load_more_row();
-            start_load_page(m_page + 1);
-        });
-    }
-
-    void remove_load_more_row()
-    {
-        if (!m_results || m_results->getChildren().empty())
-            return;
-
-        brls::View* last = m_results->getChildren().back();
-        if (dynamic_cast<brls::Box*>(last))
-            m_results->removeView(last);
-    }
-
-    void render_results()
-    {
-        clear_box(m_results);
-
-        constexpr size_t perRow = 6;
-        constexpr float rowWidth = 1160.0f;
-        constexpr float rowHeight = 252.0f;
-
-        size_t index = 0;
-        while (index < m_resultItems.size())
-        {
-            brls::Box* row = new brls::Box(brls::Axis::ROW);
-            row->setWidth(rowWidth);
-            row->setHeight(rowHeight);
-            row->setAlignItems(brls::AlignItems::FLEX_START);
-
-            const size_t stop = std::min(m_resultItems.size(), index + perRow);
-            for (; index < stop; ++index)
-                row->addView(make_anime_card(m_resultItems[index], std::string(), nullptr));
-
-            m_results->addView(row);
-        }
-
-        if (m_hasMore)
-        {
-            brls::Box* moreRow = new brls::Box(brls::Axis::ROW);
-            moreRow->setWidth(rowWidth);
-            moreRow->setHeight(rowHeight);
-            moreRow->setAlignItems(brls::AlignItems::FLEX_START);
-            moreRow->addView(make_search_load_more_card());
-            m_results->addView(moreRow);
-        }
-
-        const size_t rows = (m_resultItems.size() + perRow - 1) / perRow +
-            (m_hasMore ? 1 : 0);
-        m_results->setHeight(
-            std::max(600.0f, static_cast<float>(rows) * rowHeight + 20.0f));
-    }
 };
-
 
 class PairingActivity;
 static PairingActivity* g_pairingActivity = nullptr;
@@ -3273,9 +1217,6 @@ public:
         root->setPadding(34.0f);
         root->setBackgroundColor(nvgRGB(16, 20, 29));
 
-        m_pairCode = 10000u +
-            static_cast<uint32_t>(randomGet64() % 90000u);
-
         brls::Label* heading = new brls::Label();
         heading->setText("LINK YOUR ANILIST ACCOUNT");
         heading->setFontSize(28.0f);
@@ -3285,36 +1226,14 @@ public:
 
         brls::Label* instructions = new brls::Label();
         instructions->setText(
-            "This Switch generates a 5-digit pairing code for the current session. "
-            "Use the code with the phone pairing flow while both devices are on the same Wi-Fi.");
+            "Your requested flow is a 3-digit code from Saikou on your phone, entered on the Switch. "
+            "That code exchange is not implemented in this build yet. Keep both devices on the same Wi-Fi.");
         instructions->setFontSize(17.0f);
         instructions->setLineHeight(24.0f);
         instructions->setFocusable(false);
         instructions->setTextColor(nvgRGB(174, 184, 200));
         instructions->setMargins(0, 14, 0, 0);
         root->addView(instructions);
-
-        brls::Label* codeTitle = new brls::Label();
-        codeTitle->setText("PAIRING CODE");
-        codeTitle->setFontSize(18.0f);
-        codeTitle->setFocusable(false);
-        codeTitle->setTextColor(nvgRGB(174, 184, 200));
-        codeTitle->setMargins(0, 22, 0, 0);
-        root->addView(codeTitle);
-
-        m_pairCodeLabel = new brls::Label();
-        char pairCodeText[16];
-        std::snprintf(
-            pairCodeText,
-            sizeof(pairCodeText),
-            "%05u",
-            static_cast<unsigned>(m_pairCode));
-        m_pairCodeLabel->setText(pairCodeText);
-        m_pairCodeLabel->setFontSize(42.0f);
-        m_pairCodeLabel->setFocusable(false);
-        m_pairCodeLabel->setTextColor(nvgRGB(97, 207, 226));
-        m_pairCodeLabel->setMargins(0, 4, 0, 0);
-        root->addView(m_pairCodeLabel);
 
         m_address = get_switch_local_ip();
         brls::Label* address = new brls::Label();
@@ -3340,32 +1259,15 @@ public:
         brls::Label* back = new brls::Label();
         back->setText("Press B to return to Settings.");
         back->setFontSize(14.0f);
-        back->setFocusable(false);
+        back->setFocusable(true);
         back->setTextColor(nvgRGB(135, 147, 166));
         back->setMargins(0, 24, 0, 0);
         root->addView(back);
-
-        m_focusSink = new brls::Padding();
-        m_focusSink->setWidth(1.0f);
-        m_focusSink->setHeight(1.0f);
-        m_focusSink->alpha = 0.0f;
-        m_focusSink->setFocusable(true);
-        m_focusSink->registerAction(
-            "Pairing no-op",
-            brls::BUTTON_A,
-            [](brls::View*) {
-                return true;
-            });
-        root->addView(m_focusSink);
-
         return root;
     }
 
     void onContentAvailable() override
     {
-        if (m_focusSink)
-            brls::Application::giveFocus(m_focusSink);
-
         if (!m_listener.joinable())
             m_listener = std::thread([this] { listen_for_phone(); });
     }
@@ -3390,9 +1292,6 @@ private:
     std::string m_lastDisplayed;
     std::string m_address;
     brls::Label* m_statusLabel = nullptr;
-    brls::Padding* m_focusSink = nullptr;
-    brls::Label* m_pairCodeLabel = nullptr;
-    uint32_t m_pairCode = 0;
 
     void set_status(const std::string& message)
     {
@@ -3535,353 +1434,6 @@ private:
 class LibraryActivity;
 static LibraryActivity* g_libraryActivity = nullptr;
 
-
-static constexpr const char* kLibraryStatusNames[6] = {
-    "WATCHING", "PLANNING", "COMPLETED", "PAUSED", "DROPPED", "REWATCHING"
-};
-
-static constexpr const char* kLibraryStatusValues[6] = {
-    "CURRENT", "PLANNING", "COMPLETED", "PAUSED", "DROPPED", "REPEATING"
-};
-
-static std::vector<AniListEntry> filter_library_entries(
-    const std::vector<AniListEntry>& entries, size_t category)
-{
-    std::vector<AniListEntry> result;
-    if (category >= 6)
-        return result;
-
-    for (const AniListEntry& entry : entries)
-    {
-        if (entry.listStatus == kLibraryStatusValues[category])
-        {
-            AniListEntry item = entry;
-            item.anime.posterPath = cached_cover_path(item.anime.id);
-            result.push_back(std::move(item));
-        }
-    }
-
-    return result;
-}
-
-class LibraryCategoryActivity : public brls::Activity
-{
-public:
-    LibraryCategoryActivity(
-        size_t category,
-        const std::vector<AniListEntry>& entries)
-        : m_category(category),
-          m_items(filter_library_entries(entries, category))
-    {
-    }
-
-    ~LibraryCategoryActivity() override
-    {
-        m_coverLifetime->store(false, std::memory_order_release);
-
-        if (m_coverWorker.joinable())
-            m_coverWorker.join();
-    }
-
-    brls::View* createContentView() override
-    {
-        brls::Box* root = new brls::Box(brls::Axis::COLUMN);
-        register_page_back_action(root);
-        root->setWidthPercentage(100.0f);
-        root->setHeightPercentage(100.0f);
-        root->setPadding(30.0f);
-        root->setBackgroundColor(nvgRGB(16, 20, 29));
-
-        brls::Label* heading = new brls::Label();
-        heading->setText(
-            m_category < 6 ? kLibraryStatusNames[m_category] : "LIBRARY");
-        heading->setFontSize(30.0f);
-        heading->setTextColor(nvgRGB(244, 246, 250));
-        root->addView(heading);
-
-        m_status = new brls::Label();
-        m_status->setText(
-            "Loaded " + std::to_string(m_items.size()) + " entries");
-        m_status->setFontSize(14.0f);
-        m_status->setTextColor(nvgRGB(174, 184, 200));
-        m_status->setMargins(0, 7, 0, 0);
-        root->addView(m_status);
-
-        m_scroll = new brls::ScrollingFrame();
-        m_scroll->setWidthPercentage(100.0f);
-        m_scroll->setHeight(600.0f);
-        m_scroll->setMargins(0, 12, 0, 0);
-        m_scroll->setScrollingBehavior(brls::ScrollingBehavior::NATURAL);
-
-        m_grid = new brls::Box(brls::Axis::COLUMN);
-        m_grid->setWidth(1160.0f);
-        m_grid->setHeight(900.0f);
-        m_scroll->setContentView(m_grid);
-        root->addView(m_scroll);
-
-        append_batch();
-        return root;
-    }
-
-private:
-    struct CoverJob
-    {
-        brls::Image* image = nullptr;
-        std::string url;
-        std::string path;
-    };
-
-    size_t m_category = 0;
-    std::vector<AniListEntry> m_items;
-    size_t m_renderedCount = 0;
-
-    brls::Label* m_status = nullptr;
-    brls::ScrollingFrame* m_scroll = nullptr;
-    brls::Box* m_grid = nullptr;
-
-    std::vector<CoverJob> m_pendingCoverJobs;
-    std::thread m_coverWorker;
-    bool m_coverWorkerDone = true;
-    std::shared_ptr<std::atomic<bool>> m_coverLifetime =
-        std::make_shared<std::atomic<bool>>(true);
-
-    static constexpr size_t kBatchSize = 24;
-
-    void append_batch()
-    {
-        if (!m_grid)
-            return;
-
-        constexpr size_t perRow = 6;
-        constexpr float rowWidth = 1160.0f;
-        constexpr float rowHeight = 252.0f;
-
-        // Remove only the old Load More row. Existing anime rows/cards remain
-        // intact, so focus/navigation stays stable.
-        if (!m_grid->getChildren().empty() && m_renderedCount > 0)
-        {
-            brls::View* last = m_grid->getChildren().back();
-            brls::Box* moreRow = dynamic_cast<brls::Box*>(last);
-
-            if (moreRow && moreRow->getChildren().size() == 1)
-            {
-                brls::View* moreCard = moreRow->getChildren().front();
-
-                if (brls::Application::getCurrentFocus() == moreCard)
-                {
-                    const auto& rows = m_grid->getChildren();
-                    if (rows.size() >= 2)
-                    {
-                        brls::Box* previousRow =
-                            dynamic_cast<brls::Box*>(rows[rows.size() - 2]);
-
-                        if (previousRow && !previousRow->getChildren().empty())
-                        {
-                            brls::Application::giveFocus(
-                                previousRow->getChildren().back());
-                        }
-                    }
-                }
-
-                m_grid->removeView(moreRow);
-            }
-        }
-
-        const size_t start = m_renderedCount;
-        const size_t end =
-            std::min(m_items.size(), start + kBatchSize);
-
-        size_t index = start;
-
-        while (index < end)
-        {
-            brls::Box* row = nullptr;
-
-            if (!m_grid->getChildren().empty())
-            {
-                brls::View* last = m_grid->getChildren().back();
-                row = dynamic_cast<brls::Box*>(last);
-
-                if (row && row->getChildren().size() >= perRow)
-                    row = nullptr;
-            }
-
-            if (!row)
-            {
-                row = new brls::Box(brls::Axis::ROW);
-                row->setWidth(rowWidth);
-                row->setHeight(rowHeight);
-                row->setAlignItems(brls::AlignItems::FLEX_START);
-                m_grid->addView(row);
-            }
-
-            while (index < end && row->getChildren().size() < perRow)
-            {
-                const AniListEntry& entry = m_items[index];
-
-                std::string subtitle;
-                if (entry.listStatus == "CURRENT" ||
-                    entry.listStatus == "REPEATING")
-                {
-                    subtitle = "Episode " +
-                        std::to_string(entry.progress);
-
-                    if (entry.anime.episodes > 0)
-                        subtitle += " / " +
-                            std::to_string(entry.anime.episodes);
-                }
-                else
-                {
-                    subtitle = entry.listName.empty()
-                        ? entry.listStatus
-                        : entry.listName;
-                }
-
-                brls::Image* image = nullptr;
-                row->addView(
-                    make_anime_card(entry.anime, subtitle, &image));
-
-                struct stat st;
-                const std::string path =
-                    cached_cover_path(entry.anime.id);
-
-                if (image && !entry.anime.coverUrl.empty() &&
-                    (stat(path.c_str(), &st) != 0 ||
-                     st.st_size <= 256))
-                {
-                    m_pendingCoverJobs.push_back({
-                        image,
-                        entry.anime.coverUrl,
-                        path
-                    });
-                }
-
-                ++index;
-            }
-        }
-
-        m_renderedCount = end;
-
-        const bool hasMore = m_renderedCount < m_items.size();
-
-        if (hasMore)
-        {
-            brls::Box* moreRow = new brls::Box(brls::Axis::ROW);
-            moreRow->setWidth(rowWidth);
-            moreRow->setHeight(rowHeight);
-            moreRow->setAlignItems(brls::AlignItems::FLEX_START);
-
-            moreRow->addView(make_home_load_more_card([this] {
-                append_batch();
-            }));
-            m_grid->addView(moreRow);
-        }
-
-        const size_t dataRows =
-            (m_renderedCount + perRow - 1) / perRow;
-        const size_t totalRows = dataRows + (hasMore ? 1 : 0);
-
-        m_grid->setHeight(
-            std::max(600.0f,
-                static_cast<float>(totalRows) * rowHeight + 20.0f));
-
-        update_status();
-        start_cover_worker();
-    }
-
-    void update_status()
-    {
-        if (!m_status)
-            return;
-
-        std::string text =
-            "Loaded " + std::to_string(m_renderedCount) +
-            " / " + std::to_string(m_items.size());
-
-        if (m_renderedCount < m_items.size())
-            text += "  |  Select LOAD MORE for another 24.";
-
-        m_status->setText(text);
-    }
-
-    void start_cover_worker()
-    {
-        if (m_pendingCoverJobs.empty())
-            return;
-
-        if (m_coverWorker.joinable())
-        {
-            if (!m_coverWorkerDone)
-                return;
-
-            m_coverWorker.join();
-        }
-
-        std::vector<CoverJob> jobs;
-        jobs.swap(m_pendingCoverJobs);
-
-        m_coverWorkerDone = false;
-        const auto lifetime = m_coverLifetime;
-        const size_t total = jobs.size();
-
-        m_coverWorker = std::thread(
-            [this, lifetime, jobs = std::move(jobs), total] {
-                size_t completed = 0;
-
-                for (const CoverJob& job : jobs)
-                {
-                    if (!lifetime->load(std::memory_order_acquire))
-                        return;
-
-                    if (!download_image(job.url, job.path))
-                        continue;
-
-                    ++completed;
-
-                    brls::sync([this, lifetime,
-                        image = job.image, path = job.path,
-                        completed, total] {
-                        if (!lifetime->load(std::memory_order_acquire))
-                            return;
-
-                        image->setImageFromFile(path);
-
-                        if (m_status)
-                        {
-                            m_status->setText(
-                                "Loading posters: " +
-                                std::to_string(completed) +
-                                " / " +
-                                std::to_string(total));
-                        }
-                    });
-                }
-
-                brls::sync([this, lifetime, completed, total] {
-                    if (!lifetime->load(std::memory_order_acquire))
-                        return;
-
-                    m_coverWorkerDone = true;
-
-                    std::string text =
-                        "Loaded " +
-                        std::to_string(m_renderedCount) +
-                        " / " +
-                        std::to_string(m_items.size());
-
-                    if (m_renderedCount < m_items.size())
-                        text += "  |  Select LOAD MORE for another 24.";
-
-                    m_status->setText(text);
-
-                    perf_log_count(
-                        "LIBRARY CATEGORY PROGRESSIVE COVERS DONE",
-                        completed);
-                });
-            });
-    }
-};
-
 class LibraryActivity : public brls::Activity
 {
 public:
@@ -3889,14 +1441,8 @@ public:
 
     ~LibraryActivity() override
     {
-        m_coverLifetime->store(false, std::memory_order_release);
-
-        if (m_coverWorker.joinable())
-            m_coverWorker.join();
-
         if (m_worker.joinable())
             m_worker.join();
-
         if (g_libraryActivity == this)
             g_libraryActivity = nullptr;
     }
@@ -3904,7 +1450,6 @@ public:
     brls::View* createContentView() override
     {
         log_stage("LIBRARY VIEW CREATE START");
-
         m_content = new brls::Box(brls::Axis::COLUMN);
         register_page_back_action(m_content);
         m_content->setWidthPercentage(100.0f);
@@ -3925,28 +1470,90 @@ public:
         m_statusLabel->setMargins(0, 6, 0, 0);
         m_content->addView(m_statusLabel);
 
-        brls::Label* libraryHint = new brls::Label();
-        libraryHint->setText(
-            "AniList library is managed from Settings. "
-            "Local library lists are planned for a future update.");
-        libraryHint->setFontSize(14.0f);
-        libraryHint->setTextColor(nvgRGB(135, 147, 166));
-        libraryHint->setMargins(0, 8, 0, 0);
-        libraryHint->setFocusable(false);
-        m_content->addView(libraryHint);
+        m_pairButton = new brls::Label();
+        m_pairButton->setText("LINK ANILIST FROM PHONE");
+        m_pairButton->setFontSize(16.0f);
+        m_pairButton->setTextColor(nvgRGB(97, 207, 226));
+        m_pairButton->setMargins(0, 8, 0, 0);
+        m_pairButton->setFocusable(true);
+        m_pairButton->registerAction("Pair AniList account", brls::BUTTON_A, [](brls::View*) {
+            brls::Application::pushActivity(new PairingActivity(), brls::TransitionAnimation::NONE);
+            return true;
+        });
+        m_content->addView(m_pairButton);
 
-        m_scroll = new brls::ScrollingFrame();
-        m_scroll->setWidthPercentage(100.0f);
-        m_scroll->setHeight(570.0f);
-        m_scroll->setMargins(0, 14, 0, 0);
-        m_scroll->setScrollingBehavior(brls::ScrollingBehavior::CENTERED);
+        brls::Box* categories = new brls::Box(brls::Axis::ROW);
+        categories->setHeight(40.0f);
+        categories->setMargins(0, 18, 0, 0);
+        static const char* names[] = { "WATCHING", "PLANNING", "COMPLETED", "PAUSED", "DROPPED", "REWATCHING" };
+        for (size_t i = 0; i < 6; ++i)
+        {
+            brls::Label* tab = new brls::Label();
+            tab->setText(names[i]);
+            tab->setFontSize(13.0f);
+            tab->setMargins(0, 10, 0, 0);
+            tab->setBackgroundColor(i == m_category ? nvgRGB(36, 70, 86) : nvgRGB(27, 34, 48));
+            tab->setFocusable(true);
+            tab->registerAction("Show AniList category", brls::BUTTON_A, [this, i](brls::View*) {
+                log_stage("LIBRARY CATEGORY SELECTED");
+                if (!m_loading && m_loaded && m_category != i)
+                {
+                    m_category = i;
+                    m_page = 0;
+                    update_category_styles();
+                    start_page_load();
+                }
+                return true;
+            });
+            m_categories[i] = tab;
+            categories->addView(tab);
+        }
+        m_content->addView(categories);
 
-        m_sections = new brls::Box(brls::Axis::COLUMN);
-        m_sections->setWidth(1160.0f);
-        m_sections->setHeight(1900.0f);
-        m_scroll->setContentView(m_sections);
-        m_content->addView(m_scroll);
+        brls::Box* pageControls = new brls::Box(brls::Axis::ROW);
+        pageControls->setHeight(38.0f);
+        pageControls->setMargins(0, 8, 0, 0);
 
+        m_previous = new brls::Label();
+        m_previous->setText("PREVIOUS");
+        m_previous->setFontSize(13.0f);
+        m_previous->setFocusable(true);
+        m_previous->registerAction("Previous library page", brls::BUTTON_A, [this](brls::View*) {
+            if (!m_loading && m_loaded && m_page > 0)
+            {
+                --m_page;
+                start_page_load();
+            }
+            return true;
+        });
+        pageControls->addView(m_previous);
+
+        m_pageInfo = new brls::Label();
+        m_pageInfo->setFontSize(13.0f);
+        m_pageInfo->setTextColor(nvgRGB(174, 184, 200));
+        m_pageInfo->setMargins(0, 28, 0, 0);
+        pageControls->addView(m_pageInfo);
+
+        m_next = new brls::Label();
+        m_next->setText("NEXT");
+        m_next->setFontSize(13.0f);
+        m_next->setMargins(0, 28, 0, 0);
+        m_next->setFocusable(true);
+        m_next->registerAction("Next library page", brls::BUTTON_A, [this](brls::View*) {
+            if (!m_loading && m_loaded && m_page + 1 < page_count())
+            {
+                ++m_page;
+                start_page_load();
+            }
+            return true;
+        });
+        pageControls->addView(m_next);
+        m_content->addView(pageControls);
+
+        m_cards = new brls::Box(brls::Axis::COLUMN);
+        m_cards->setWidthPercentage(100.0f);
+        m_cards->setMargins(0, 8, 0, 0);
+        m_content->addView(m_cards);
         log_stage("LIBRARY VIEW BUILT");
         return m_content;
     }
@@ -3954,546 +1561,170 @@ public:
     void onContentAvailable() override
     {
         log_stage("ACTIVITY OPEN: Library");
-
         m_token = load_anilist_token();
-
         if (m_token.empty())
         {
+            log_stage("LIBRARY HAS NO SAVED ANILIST TOKEN");
+            m_loading = false;
             m_loaded = true;
-            m_loadStatus =
-                "No AniList account is linked. Use Settings to connect AniList. "
-                "Local library lists are planned for a future update.";
-
+            m_loadStatus = "No AniList account is linked. Pair with the Saikou phone app above.";
             if (m_statusLabel)
                 m_statusLabel->setText(m_loadStatus);
-
-            build_sections();
+            log_stage("LIBRARY CONTENT READY WITHOUT ACCOUNT");
             return;
         }
 
         m_loading = true;
         log_stage("LIBRARY REQUEST STARTED");
-
         m_worker = std::thread([this] {
-            m_entries =
-                fetch_anilist_library(m_token, m_username, m_loadStatus);
-
+            m_entries = fetch_anilist_library(m_token, m_username, m_loadStatus);
+            m_pageItems = collect_page_items();
+            download_page_images(m_pageItems);
             m_ready.store(true, std::memory_order_release);
         });
     }
 
     void tick()
     {
-        // Match Home: when a horizontal scrolling frame itself receives focus,
-        // immediately transfer focus to its first actual anime card.
-        brls::View* currentFocus = brls::Application::getCurrentFocus();
-
-        for (brls::HScrollingFrame* sectionScroll : m_categoryScrolls)
-        {
-            if (!sectionScroll || currentFocus != sectionScroll)
-                continue;
-
-            brls::View* card = sectionScroll->getDefaultFocus();
-            if (card)
-                brls::Application::giveFocus(card);
-            break;
-        }
-
         if (!m_ready.load(std::memory_order_acquire))
             return;
-
         if (m_worker.joinable())
             m_worker.join();
-
-        m_ready.store(false, std::memory_order_release);
         m_loading = false;
         m_loaded = true;
-
-        build_sections();
-        log_stage("LIBRARY SECTIONS ATTACHED");
+        update_category_styles();
+        render_page();
+        log_stage("LIBRARY PAGE ATTACHED");
+        m_ready.store(false, std::memory_order_release);
     }
 
 private:
-    static constexpr size_t kCategoryCount = 6;
-    static constexpr size_t kHomeBatchSize = 12;
+    static constexpr size_t kPageSize = 6;
+    static const char* const kStatuses[6];
 
     brls::Box* m_content = nullptr;
     brls::Label* m_statusLabel = nullptr;
-    brls::ScrollingFrame* m_scroll = nullptr;
-    brls::Box* m_sections = nullptr;
-
+    brls::Label* m_pairButton = nullptr;
+    brls::Label* m_categories[6]{};
+    brls::Label* m_previous = nullptr;
+    brls::Label* m_next = nullptr;
+    brls::Label* m_pageInfo = nullptr;
+    brls::Box* m_cards = nullptr;
     std::string m_token;
     std::string m_username;
     std::string m_loadStatus;
     std::vector<AniListEntry> m_entries;
-
+    std::vector<AniListEntry> m_pageItems;
     std::thread m_worker;
     std::atomic<bool> m_ready{ false };
     bool m_loading = false;
     bool m_loaded = false;
+    size_t m_category = 0;
+    size_t m_page = 0;
 
-    struct CoverJob
+    std::vector<AniListEntry> collect_page_items() const
     {
-        brls::Image* image = nullptr;
-        std::string url;
-        std::string path;
-    };
-
-    std::vector<brls::HScrollingFrame*> m_categoryScrolls;
-    std::vector<CoverJob> m_pendingCoverJobs;
-    std::thread m_coverWorker;
-    bool m_coverWorkerDone = true;
-    std::shared_ptr<std::atomic<bool>> m_coverLifetime =
-        std::make_shared<std::atomic<bool>>(true);
-
-    void build_sections()
-    {
-        if (!m_sections)
-            return;
-
-        clear_box(m_sections);
-        m_categoryScrolls.clear();
-
-        std::vector<AniListEntry> continueEntries;
-        size_t currentCount = 0;
-
+        std::vector<AniListEntry> matching;
         for (const AniListEntry& entry : m_entries)
-        {
-            if (entry.listStatus != "CURRENT")
-                continue;
-
-            ++currentCount;
-
-            if (continueEntries.size() < kHomeBatchSize)
-                continueEntries.push_back(entry);
-        }
-
-        if (!continueEntries.empty())
-        {
-            brls::Box* continueHeader =
-                new brls::Box(brls::Axis::ROW);
-            continueHeader->setWidth(1160.0f);
-            continueHeader->setHeight(28.0f);
-            continueHeader->setAlignItems(
-                brls::AlignItems::CENTER);
-
-            brls::Label* continueTitle =
-                new brls::Label();
-            continueTitle->setText("CONTINUE WATCHING");
-            continueTitle->setFontSize(19.0f);
-            continueTitle->setTextColor(
-                nvgRGB(220, 228, 240));
-            continueHeader->addView(continueTitle);
-
-            brls::Label* continueCount =
-                new brls::Label();
-            continueCount->setText(
-                "  " +
-                std::to_string(continueEntries.size()));
-            continueCount->setFontSize(13.0f);
-            continueCount->setTextColor(
-                nvgRGB(135, 147, 166));
-            continueHeader->addView(continueCount);
-
-            m_sections->addView(continueHeader);
-
-            brls::HScrollingFrame* continueScroll =
-                new brls::HScrollingFrame();
-            continueScroll->setWidth(1160.0f);
-            continueScroll->setHeight(260.0f);
-            continueScroll->setMargins(0, 5, 0, 0);
-            continueScroll->setScrollingBehavior(
-                brls::ScrollingBehavior::CENTERED);
-
-            brls::Box* continueRow =
-                new brls::Box(brls::Axis::ROW);
-
-            const bool hasContinueMore =
-                currentCount > kHomeBatchSize;
-
-            const size_t totalCards =
-                continueEntries.size() +
-                (hasContinueMore ? 1 : 0);
-
-            continueRow->setWidth(
-                std::max(
-                    1160.0f,
-                    static_cast<float>(totalCards) * 192.0f));
-            continueRow->setHeight(252.0f);
-            continueRow->setAlignItems(
-                brls::AlignItems::FLEX_START);
-
-            for (const AniListEntry& entry : continueEntries)
-            {
-                std::string subtitle =
-                    "Episode " +
-                    std::to_string(entry.progress);
-
-                if (entry.anime.episodes > 0)
-                    subtitle +=
-                        " / " +
-                        std::to_string(entry.anime.episodes);
-
-                brls::Image* poster = nullptr;
-
-                continueRow->addView(
-                    make_anime_card(
-                        entry.anime,
-                        subtitle,
-                        &poster));
-
-                struct stat st;
-                const std::string coverPath =
-                    cached_cover_path(entry.anime.id);
-
-                if (poster &&
-                    !entry.anime.coverUrl.empty() &&
-                    (stat(
-                        coverPath.c_str(),
-                        &st) != 0 ||
-                     st.st_size <= 256))
-                {
-                    m_pendingCoverJobs.push_back({
-                        poster,
-                        entry.anime.coverUrl,
-                        coverPath
-                    });
-                }
-            }
-
-            if (hasContinueMore)
-            {
-                continueRow->addView(
-                    make_home_load_more_card([this] {
-                        brls::Application::pushActivity(
-                            new LibraryCategoryActivity(
-                                0,
-                                m_entries),
-                            brls::TransitionAnimation::NONE);
-                    }));
-            }
-
-            continueRow->setDefaultFocusedIndex(0);
-            continueScroll->setContentView(continueRow);
-            m_sections->addView(continueScroll);
-            m_categoryScrolls.push_back(
-                continueScroll);
-
-            brls::Padding* continueSpacer =
-                new brls::Padding();
-            continueSpacer->setHeight(14.0f);
-            m_sections->addView(continueSpacer);
-
-            char marker[128];
-            std::snprintf(
-                marker,
-                sizeof(marker),
-                "LIBRARY CONTINUE ROW BUILT count=%zu",
-                continueEntries.size());
-            log_stage(marker);
-        }
-        else
-        {
-            log_stage(
-                "LIBRARY CONTINUE ROW BUILT count=0");
-        }
-
-        for (size_t category = 1;
-             category < kCategoryCount;
-             ++category)
-        {
-            const std::vector<AniListEntry> matching =
-                filter_library_entries(m_entries, category);
-
-            brls::Box* header =
-                new brls::Box(brls::Axis::ROW);
-            header->setWidth(1160.0f);
-            header->setHeight(28.0f);
-            header->setAlignItems(brls::AlignItems::CENTER);
-
-            brls::Label* title = new brls::Label();
-            title->setText(kLibraryStatusNames[category]);
-            title->setFontSize(19.0f);
-            title->setTextColor(nvgRGB(220, 228, 240));
-            header->addView(title);
-
-            brls::Label* count = new brls::Label();
-            count->setText(
-                "  " + std::to_string(matching.size()));
-            count->setFontSize(13.0f);
-            count->setTextColor(nvgRGB(135, 147, 166));
-            header->addView(count);
-
-            m_sections->addView(header);
-
-            if (matching.empty())
-            {
-                brls::Label* empty = new brls::Label();
-                empty->setText("No titles in this list.");
-                empty->setFontSize(15.0f);
-                empty->setTextColor(nvgRGB(135, 147, 166));
-                empty->setFocusable(false);
-                empty->setMargins(0, 5, 0, 9);
-                m_sections->addView(empty);
-                continue;
-            }
-
-            brls::HScrollingFrame* scroll =
-                new brls::HScrollingFrame();
-            scroll->setWidth(1160.0f);
-            scroll->setHeight(260.0f);
-            scroll->setMargins(0, 5, 0, 0);
-            scroll->setScrollingBehavior(
-                brls::ScrollingBehavior::CENTERED);
-
-            brls::Box* row =
-                new brls::Box(brls::Axis::ROW);
-
-            const size_t visibleCount =
-                std::min(kHomeBatchSize, matching.size());
-
-            const bool hasMore =
-                matching.size() > kHomeBatchSize;
-
-            const size_t totalCards =
-                visibleCount + (hasMore ? 1 : 0);
-
-            row->setWidth(
-                std::max(
-                    1160.0f,
-                    static_cast<float>(totalCards) * 192.0f));
-            row->setHeight(252.0f);
-            row->setAlignItems(brls::AlignItems::FLEX_START);
-
-            for (size_t index = 0;
-                 index < visibleCount;
-                 ++index)
-            {
-                const AniListEntry& entry = matching[index];
-
-                std::string subtitle;
-
-                if (entry.listStatus == "CURRENT" ||
-                    entry.listStatus == "REPEATING")
-                {
-                    subtitle =
-                        "Episode " +
-                        std::to_string(entry.progress);
-
-                    if (entry.anime.episodes > 0)
-                        subtitle +=
-                            " / " +
-                            std::to_string(entry.anime.episodes);
-                }
-                else
-                {
-                    subtitle =
-                        entry.listName.empty()
-                            ? entry.listStatus
-                            : entry.listName;
-                }
-
-                brls::Image* poster = nullptr;
-
-                row->addView(
-                    make_anime_card(
-                        entry.anime,
-                        subtitle,
-                        &poster));
-
-                struct stat st;
-                const std::string coverPath =
-                    cached_cover_path(entry.anime.id);
-
-                if (poster &&
-                    !entry.anime.coverUrl.empty() &&
-                    (stat(coverPath.c_str(), &st) != 0 ||
-                     st.st_size <= 256))
-                {
-                    m_pendingCoverJobs.push_back({
-                        poster,
-                        entry.anime.coverUrl,
-                        coverPath
-                    });
-                }
-            }
-
-            if (hasMore)
-            {
-                const size_t categoryCopy = category;
-
-                row->addView(
-                    make_home_load_more_card(
-                        [this, categoryCopy] {
-                            brls::Application::pushActivity(
-                                new LibraryCategoryActivity(
-                                    categoryCopy,
-                                    m_entries),
-                                brls::TransitionAnimation::NONE);
-                        }));
-            }
-
-            scroll->setContentView(row);
-            m_sections->addView(scroll);
-            m_categoryScrolls.push_back(scroll);
-
-            brls::Padding* spacer = new brls::Padding();
-            spacer->setHeight(14.0f);
-            m_sections->addView(spacer);
-        }
-
-        brls::Padding* bottomSpacer =
-            new brls::Padding();
-        bottomSpacer->setHeight(140.0f);
-        m_sections->addView(bottomSpacer);
-
-        // Keep enough real content extent for the last REWATCHING row
-        // to scroll completely into the 570px viewport.
-        m_sections->setHeight(
-            std::max(
-                2400.0f,
-                static_cast<float>(
-                    (kCategoryCount - 1) * 304 +
-                    (!continueEntries.empty()
-                        ? 304
-                        : 0) +
-                    300)));
-
-        if (m_statusLabel)
-        {
-            std::string status = m_loadStatus;
-
-            if (!m_username.empty())
-                status += "  |  @" + m_username;
-
-            status +=
-                "  |  " +
-                std::to_string(m_entries.size()) +
-                " library entries";
-
-            m_statusLabel->setText(status);
-        }
-
-        start_cover_worker();
-
-        log_stage("LIBRARY HOME ROWS BUILT");
+            if (entry.listStatus == kStatuses[m_category])
+                matching.push_back(entry);
+        const size_t start = m_page * kPageSize;
+        std::vector<AniListEntry> page;
+        for (size_t i = start; i < matching.size() && i < start + kPageSize; ++i)
+            page.push_back(matching[i]);
+        return page;
     }
 
-    void start_cover_worker()
+    void download_page_images(std::vector<AniListEntry>& page)
     {
-        if (m_pendingCoverJobs.empty())
+        for (AniListEntry& entry : page)
         {
-            log_stage(
-                "LIBRARY PROGRESSIVE COVERS: no uncached covers");
-            return;
+            entry.anime.posterPath = cached_cover_path(entry.anime.id);
+            if (!download_image(entry.anime.coverUrl, entry.anime.posterPath))
+                entry.anime.posterPath.clear();
         }
-
-        if (m_coverWorker.joinable())
-        {
-            if (!m_coverWorkerDone)
-                return;
-
-            m_coverWorker.join();
-        }
-
-        std::vector<CoverJob> jobs;
-        jobs.swap(m_pendingCoverJobs);
-
-        m_coverWorkerDone = false;
-        const auto lifetime = m_coverLifetime;
-        const size_t total = jobs.size();
-
-        char startMarker[128];
-        std::snprintf(
-            startMarker,
-            sizeof(startMarker),
-            "LIBRARY PROGRESSIVE COVERS START count=%zu",
-            total);
-        log_stage(startMarker);
-
-        m_coverWorker = std::thread(
-            [this, lifetime, jobs = std::move(jobs), total] {
-                size_t completed = 0;
-
-                for (const CoverJob& job : jobs)
-                {
-                    if (!lifetime->load(
-                            std::memory_order_acquire))
-                        return;
-
-                    if (!download_image(job.url, job.path))
-                        continue;
-
-                    ++completed;
-
-                    brls::sync(
-                        [this,
-                         lifetime,
-                         image = job.image,
-                         path = job.path,
-                         completed,
-                         total] {
-                            if (!lifetime->load(
-                                    std::memory_order_acquire))
-                                return;
-
-                            image->setImageFromFile(path);
-
-                            char marker[128];
-                            std::snprintf(
-                                marker,
-                                sizeof(marker),
-                                "LIBRARY PROGRESSIVE COVER READY %zu/%zu",
-                                completed,
-                                total);
-                            log_stage(marker);
-
-                            if (m_statusLabel)
-                            {
-                                m_statusLabel->setText(
-                                    "Loading posters: " +
-                                    std::to_string(completed) +
-                                    " / " +
-                                    std::to_string(total));
-                            }
-                        });
-                }
-
-                brls::sync(
-                    [this, lifetime, completed, total] {
-                        if (!lifetime->load(
-                                std::memory_order_acquire))
-                            return;
-
-                        m_coverWorkerDone = true;
-
-                        std::string status = m_loadStatus;
-                        if (!m_username.empty())
-                            status += "  |  @" + m_username;
-
-                        status +=
-                            "  |  " +
-                            std::to_string(m_entries.size()) +
-                            " library entries";
-
-                        if (m_statusLabel)
-                            m_statusLabel->setText(status);
-
-                        char marker[128];
-                        std::snprintf(
-                            marker,
-                            sizeof(marker),
-                            "LIBRARY PROGRESSIVE COVERS DONE %zu/%zu",
-                            completed,
-                            total);
-                        log_stage(marker);
-                    });
-            });
     }
 
+    size_t page_count() const
+    {
+        size_t count = 0;
+        for (const AniListEntry& entry : m_entries)
+            if (entry.listStatus == kStatuses[m_category]) ++count;
+        const size_t pages = (count + kPageSize - 1) / kPageSize;
+        return pages == 0 ? 1 : pages;
+    }
 
+    void start_page_load()
+    {
+        if (m_worker.joinable())
+            m_worker.join();
+        m_loading = true;
+        m_statusLabel->setText("Loading " + std::string(kStatuses[m_category]) + " list...");
+        m_worker = std::thread([this] {
+            m_pageItems = collect_page_items();
+            download_page_images(m_pageItems);
+            m_ready.store(true, std::memory_order_release);
+        });
+    }
+
+    void update_category_styles()
+    {
+        for (size_t i = 0; i < 6; ++i)
+            if (m_categories[i])
+                m_categories[i]->setBackgroundColor(i == m_category ? nvgRGB(36, 70, 86) : nvgRGB(27, 34, 48));
+    }
+
+    void render_page()
+    {
+        clear_box(m_cards);
+        for (const AniListEntry& entry : m_pageItems)
+        {
+            std::string progress;
+            if (entry.listStatus == "CURRENT" || entry.listStatus == "REPEATING")
+            {
+                progress = "Episode " + std::to_string(entry.progress);
+                if (entry.anime.episodes > 0)
+                    progress += " / " + std::to_string(entry.anime.episodes);
+            }
+            else
+            {
+                progress = entry.listName.empty() ? entry.listStatus : entry.listName;
+            }
+
+            brls::Box* row = m_cards->getChildren().empty()
+                ? nullptr : dynamic_cast<brls::Box*>(m_cards->getChildren().back());
+            if (!row || row->getChildren().size() >= 6)
+            {
+                row = new brls::Box(brls::Axis::ROW);
+                row->setWidth(1160.0f);
+                row->setHeight(268.0f);
+                row->setAlignItems(brls::AlignItems::FLEX_START);
+                m_cards->addView(row);
+            }
+            row->addView(make_anime_card(entry.anime, progress));
+        }
+        if (m_pageItems.empty())
+        {
+            brls::Label* empty = new brls::Label();
+            empty->setText("No anime is saved in this list.");
+            empty->setFontSize(17.0f);
+            empty->setTextColor(nvgRGB(174, 184, 200));
+            m_cards->addView(empty);
+        }
+
+        m_pageInfo->setText("Page " + std::to_string(m_page + 1) + " / " + std::to_string(page_count()));
+        m_previous->setText(m_page > 0 ? "PREVIOUS" : " ");
+        m_next->setText(m_page + 1 < page_count() ? "NEXT" : " ");
+        std::string status = m_loadStatus;
+        if (!m_username.empty())
+            status += "  |  @" + m_username;
+        m_statusLabel->setText(status);
+    }
 };
 
+const char* const LibraryActivity::kStatuses[6] = {
+    "CURRENT", "PLANNING", "COMPLETED", "PAUSED", "DROPPED", "REPEATING"
+};
 
 class SettingsActivity : public brls::Activity
 {
@@ -4501,9 +1732,7 @@ public:
     brls::View* createContentView() override
     {
         log_stage("ACTIVITY OPEN: Settings");
-
-        brls::Box* root =
-            new brls::Box(brls::Axis::COLUMN);
+        brls::Box* root = new brls::Box(brls::Axis::COLUMN);
         register_page_back_action(root);
         root->setWidthPercentage(100.0f);
         root->setHeightPercentage(100.0f);
@@ -4513,278 +1742,51 @@ public:
         brls::Label* heading = new brls::Label();
         heading->setText("SETTINGS");
         heading->setFontSize(28.0f);
-        heading->setFocusable(false);
         root->addView(heading);
-
-        m_scroll = new brls::ScrollingFrame();
-        m_scroll->setGrow(1.0f);
-        m_scroll->setScrollingBehavior(
-            brls::ScrollingBehavior::CENTERED);
-        m_scroll->setMargins(0, 8, 0, 0);
-
-        brls::Box* content =
-            new brls::Box(brls::Axis::COLUMN);
-        content->setWidthPercentage(100.0f);
-        content->setPadding(0.0f, 0.0f, 80.0f, 0.0f);
-
-        m_scroll->setContentView(content);
-        root->addView(m_scroll);
-
-        brls::Label* accountHeading = new brls::Label();
-        accountHeading->setText("ANILIST ACCOUNT");
-        accountHeading->setFontSize(19.0f);
-        accountHeading->setTextColor(nvgRGB(220, 228, 240));
-        accountHeading->setFocusable(false);
-        content->addView(accountHeading);
-
-        brls::Padding* accountTitleGap = new brls::Padding();
-        accountTitleGap->setHeight(8.0f);
-        content->addView(accountTitleGap);
 
         brls::Label* account = new brls::Label();
         account->setText(load_anilist_token().empty()
-            ? "Not linked to AniList."
+            ? "No AniList account linked."
             : "AniList account token is saved on this Switch.");
-        account->setFontSize(15.0f);
+        account->setFontSize(16.0f);
         account->setTextColor(nvgRGB(174, 184, 200));
-        account->setFocusable(false);
-        content->addView(account);
+        account->setMargins(0, 7, 0, 0);
+        root->addView(account);
 
-        brls::Padding* accountButtonGap = new brls::Padding();
-        accountButtonGap->setHeight(18.0f);
-        content->addView(accountButtonGap);
-
-        brls::Box* pair =
-            new brls::Box(brls::Axis::ROW);
-        pair->setWidthPercentage(100.0f);
-        pair->setHeight(46.0f);
-        pair->setPadding(10.0f);
-        pair->setAlignItems(brls::AlignItems::CENTER);
-        pair->setBackgroundColor(nvgRGB(27, 34, 48));
-        pair->setBorderColor(nvgRGB(48, 57, 74));
-        pair->setBorderThickness(1.0f);
-        pair->setCornerRadius(6.0f);
-        pair->setFocusable(true);
-
-        brls::Label* pairLabel = new brls::Label();
-        pairLabel->setText(load_anilist_token().empty()
+        brls::Label* pair = new brls::Label();
+        pair->setText(load_anilist_token().empty()
             ? "LINK ANILIST FROM PHONE"
             : "PAIR AGAIN / CHANGE ANILIST ACCOUNT");
-        pairLabel->setFontSize(17.0f);
-        pairLabel->setTextColor(nvgRGB(97, 207, 226));
-        pairLabel->setFocusable(false);
-        pair->addView(pairLabel);
-
-        pair->registerAction(
-            "Link AniList account",
-            brls::BUTTON_A,
-            [](brls::View*) {
-                log_stage("SETTINGS OPEN PAIRING");
-                brls::Application::pushActivity(
-                    new PairingActivity(),
-                    brls::TransitionAnimation::NONE);
-                return true;
-            });
-        content->addView(pair);
-
-        brls::Padding* pairSourceGap = new brls::Padding();
-        pairSourceGap->setHeight(26.0f);
-        content->addView(pairSourceGap);
+        pair->setFontSize(17.0f);
+        pair->setTextColor(nvgRGB(97, 207, 226));
+        pair->setMargins(0, 12, 0, 0);
+        pair->setFocusable(true);
+        pair->registerAction("Link AniList account", brls::BUTTON_A, [](brls::View*) {
+            log_stage("SETTINGS OPEN PAIRING");
+            brls::Application::pushActivity(new PairingActivity(), brls::TransitionAnimation::NONE);
+            return true;
+        });
+        root->addView(pair);
 
         brls::Label* sourceHeading = new brls::Label();
         sourceHeading->setText("EPISODE SOURCES");
         sourceHeading->setFontSize(20.0f);
-        sourceHeading->setTextColor(nvgRGB(220, 228, 240));
-        sourceHeading->setFocusable(false);
-        content->addView(sourceHeading);
-
-        brls::Padding* sourceHeaderGap = new brls::Padding();
-        sourceHeaderGap->setHeight(12.0f);
-        content->addView(sourceHeaderGap);
-
-        content->addView(make_preferred_source());
-
-        brls::Padding* preferredSourceGap =
-            new brls::Padding();
-        preferredSourceGap->setHeight(14.0f);
-        content->addView(preferredSourceGap);
-
-        brls::Label* apiUrlHint = new brls::Label();
-        apiUrlHint->setText(
-            "Enter deployed scraper API server URLs here. Anime website domains such as miruro.to or animepahe.ng return web pages, not the JSON this app expects. If self-hosted on your PC, use its LAN IP and port.");
-        apiUrlHint->setFontSize(13.0f);
-        apiUrlHint->setLineHeight(18.0f);
-        apiUrlHint->setTextColor(nvgRGB(174, 184, 200));
-        apiUrlHint->setMargins(0, 8, 0, 12);
-        apiUrlHint->setFocusable(false);
-        content->addView(apiUrlHint);
+        sourceHeading->setMargins(0, 18, 0, 10);
+        root->addView(sourceHeading);
 
         for (size_t i = 0; i < kApiSourceCount; ++i)
-        {
-            content->addView(make_toggle(i));
-            content->addView(make_endpoint_editor(i, false));
-            content->addView(make_endpoint_editor(i, true));
-
-            if (i + 1 < kApiSourceCount)
-            {
-                brls::Padding* sourceGap =
-                    new brls::Padding();
-                sourceGap->setHeight(14.0f);
-                content->addView(sourceGap);
-            }
-        }
-
-        brls::Label* sourceHint = new brls::Label();
-        sourceHint->setText(
-            "Enable the sources you want available for episode lookup.");
-        sourceHint->setFontSize(13.0f);
-        sourceHint->setTextColor(nvgRGB(135, 147, 166));
-        sourceHint->setFocusable(false);
-        brls::Padding* sourceHintGap = new brls::Padding();
-        sourceHintGap->setHeight(10.0f);
-        content->addView(sourceHintGap);
-        content->addView(sourceHint);
-
-        brls::Label* aboutHeading = new brls::Label();
-        aboutHeading->setText("APP");
-        aboutHeading->setFontSize(19.0f);
-        aboutHeading->setMargins(0, 22, 0, 6);
-        aboutHeading->setTextColor(nvgRGB(220, 228, 240));
-        aboutHeading->setFocusable(false);
-        content->addView(aboutHeading);
-
-        m_about = new brls::Label();
-        m_about->setText(
-            "SaikouTV NX  |  Live AniList data  |  "
-            "Episode sources are saved to the Switch.");
-        m_about->setFontSize(13.0f);
-        m_about->setTextColor(nvgRGB(135, 147, 166));
-        m_about->setFocusable(false);
-        content->addView(m_about);
-
+            root->addView(make_toggle(i));
         log_stage("SETTINGS VIEW BUILT");
         return root;
     }
 
 private:
-    brls::ScrollingFrame* m_scroll = nullptr;
-    brls::Label* m_selectedSource = nullptr;
-    brls::Label* m_about = nullptr;
-
-    size_t enabled_source_count() const
-    {
-        size_t count = 0;
-        for (size_t i = 0; i < kApiSourceCount; ++i)
-        {
-            if (g_providerEnabled[i])
-                ++count;
-        }
-        return count;
-    }
-
-    void refresh_selected_source()
-    {
-        if (!m_selectedSource)
-            return;
-
-        std::string text = "PREFERRED: ";
-
-        if (g_selectedApiSource >= 0 &&
-            static_cast<size_t>(g_selectedApiSource) < kApiSourceCount &&
-            g_providerEnabled[g_selectedApiSource])
-        {
-            text += kApiSources[g_selectedApiSource].name;
-        }
-        else
-        {
-            text += "NONE";
-        }
-
-        text +=
-            "    (" +
-            std::to_string(enabled_source_count()) +
-            "/" +
-            std::to_string(kApiSourceCount) +
-            " enabled)";
-
-        m_selectedSource->setText(text);
-    }
-
-    brls::Box* make_preferred_source()
-    {
-        brls::Box* row =
-            new brls::Box(brls::Axis::ROW);
-        row->setWidthPercentage(100.0f);
-        row->setHeight(46.0f);
-        row->setMargins(0, 0, 0, 0);
-        row->setPadding(10.0f);
-        row->setAlignItems(brls::AlignItems::CENTER);
-        row->setBackgroundColor(nvgRGB(27, 34, 48));
-        row->setBorderColor(nvgRGB(48, 57, 74));
-        row->setBorderThickness(1.0f);
-        row->setCornerRadius(6.0f);
-        row->setFocusable(true);
-
-        m_selectedSource = new brls::Label();
-        m_selectedSource->setFontSize(16.0f);
-        m_selectedSource->setTextColor(nvgRGB(214, 222, 235));
-        m_selectedSource->setFocusable(false);
-        row->addView(m_selectedSource);
-        refresh_selected_source();
-
-        row->registerAction(
-            "Cycle preferred episode source",
-            brls::BUTTON_A,
-            [this](brls::View*) {
-                if (enabled_source_count() == 0)
-                {
-                    refresh_selected_source();
-                    return true;
-                }
-
-                const int start = g_selectedApiSource;
-
-                for (size_t offset = 1;
-                     offset <= kApiSourceCount;
-                     ++offset)
-                {
-                    const size_t candidate =
-                        (static_cast<size_t>(
-                            start < 0 ? 0 : start) +
-                         offset) %
-                        kApiSourceCount;
-
-                    if (g_providerEnabled[candidate])
-                    {
-                        g_selectedApiSource =
-                            static_cast<int>(candidate);
-                        save_source_settings();
-                        refresh_selected_source();
-
-                        char marker[128];
-                        std::snprintf(
-                            marker,
-                            sizeof(marker),
-                            "SETTINGS PREFERRED SOURCE id=%d",
-                            g_selectedApiSource);
-                        log_stage(marker);
-                        break;
-                    }
-                }
-
-                return true;
-            });
-
-        return row;
-    }
-
     brls::Box* make_toggle(size_t index)
     {
-        brls::Box* toggle =
-            new brls::Box(brls::Axis::ROW);
+        brls::Box* toggle = new brls::Box(brls::Axis::ROW);
         toggle->setWidthPercentage(100.0f);
         toggle->setHeight(46.0f);
-        toggle->setMargins(0, 0, 0, 0);
+        toggle->setMargins(0, 9, 0, 0);
         toggle->setPadding(10.0f);
         toggle->setAlignItems(brls::AlignItems::CENTER);
         toggle->setBackgroundColor(nvgRGB(27, 34, 48));
@@ -4797,1453 +1799,62 @@ private:
         label->setText(toggle_text(index));
         label->setFontSize(17.0f);
         label->setTextColor(nvgRGB(214, 222, 235));
-        label->setFocusable(false);
         toggle->addView(label);
-
-        toggle->registerAction(
-            "Toggle source API",
-            brls::BUTTON_A,
-            [this, label, index](brls::View*) {
-                log_stage("SETTINGS SOURCE TOGGLE");
-
-                g_providerEnabled[index] =
-                    !g_providerEnabled[index];
-
-                if (!g_providerEnabled[index] &&
-                    g_selectedApiSource ==
-                        static_cast<int>(index))
-                {
-                    g_selectedApiSource = -1;
-
-                    for (size_t candidate = 0;
-                         candidate < kApiSourceCount;
-                         ++candidate)
-                    {
-                        if (g_providerEnabled[candidate])
-                        {
-                            g_selectedApiSource =
-                                static_cast<int>(candidate);
-                            break;
-                        }
-                    }
-                }
-
-                save_source_settings();
-                label->setText(toggle_text(index));
-                refresh_selected_source();
-                return true;
-            });
-
+        toggle->registerAction("Toggle source API", brls::BUTTON_A, [this, label, index](brls::View*) {
+            log_stage("SETTINGS SOURCE TOGGLE");
+            g_providerEnabled[index] = !g_providerEnabled[index];
+            save_source_settings();
+            label->setText(toggle_text(index));
+            return true;
+        });
         return toggle;
-    }
-
-    brls::Box* make_endpoint_editor(size_t index, bool fallback)
-    {
-        brls::Box* row = new brls::Box(brls::Axis::ROW);
-        row->setWidthPercentage(100.0f);
-        row->setHeight(42.0f);
-        row->setMargins(0, 4, 0, 0);
-        row->setPadding(8.0f);
-        row->setAlignItems(brls::AlignItems::CENTER);
-        row->setBackgroundColor(nvgRGB(22, 28, 40));
-        row->setBorderColor(nvgRGB(48, 57, 74));
-        row->setBorderThickness(1.0f);
-        row->setCornerRadius(6.0f);
-        row->setFocusable(true);
-
-        brls::Label* label = new brls::Label();
-        const std::string& configuredUrl = fallback
-            ? g_providerFallbackBaseUrl[index] : g_providerBaseUrl[index];
-        const std::string endpoint = (fallback ? "Fallback API: " : "Primary API: ") +
-            (configuredUrl.empty() ? std::string("not set — press A to configure") : configuredUrl);
-        label->setText(endpoint);
-        label->setFontSize(13.0f);
-        label->setTextColor(nvgRGB(174, 184, 200));
-        label->setFocusable(false);
-        row->addView(label);
-
-        row->registerAction(fallback ? "Set fallback scraper API URL" : "Set primary scraper API URL",
-            brls::BUTTON_A, [this, index, fallback, label](brls::View*) {
-                SwkbdConfig keyboard{};
-                if (R_FAILED(swkbdCreate(&keyboard, 0)))
-                    return true;
-                swkbdConfigMakePresetDefault(&keyboard);
-                swkbdConfigSetHeaderText(&keyboard, fallback ? "Fallback scraper API" : "Primary scraper API");
-                swkbdConfigSetGuideText(&keyboard, "Enter the deployed JSON API service root");
-                swkbdConfigSetSubText(&keyboard, "This is the API server address, not the anime website domain");
-                swkbdConfigSetOkButtonText(&keyboard, "Save");
-                std::string& targetUrl = fallback
-                    ? g_providerFallbackBaseUrl[index] : g_providerBaseUrl[index];
-                if (!targetUrl.empty())
-                    swkbdConfigSetInitialText(&keyboard, targetUrl.c_str());
-
-                brls::Application::setGlobalQuit(false);
-                g_restoreGlobalQuitAfterKeyboard = true;
-                char input[384] = {};
-                const Result result = swkbdShow(&keyboard, input, sizeof(input));
-                swkbdClose(&keyboard);
-                if (R_SUCCEEDED(result))
-                {
-                    targetUrl = trim_api_base(input);
-                    save_source_settings();
-                    label->setText(std::string(fallback ? "Fallback API: " : "Primary API: ") +
-                        (targetUrl.empty() ? "not set — press A to configure" : targetUrl));
-                    log_stage("SETTINGS SCRAPER API URL SAVED");
-                }
-                return true;
-            });
-        return row;
     }
 
     std::string toggle_text(size_t index) const
     {
-        return std::string(
-            g_providerEnabled[index] ? "[ON]  " : "[OFF] ") +
-            kApiSources[index].name +
-            "    (press A to toggle)";
+        return std::string(g_providerEnabled[index] ? "[ON]  " : "[OFF] ") +
+            kApiSources[index].name + "    (press A to toggle)";
     }
 };
 
-struct ContinueWatchItem
+static void fetch_continue_watching(const std::string& token, SaikouAnime& anime,
+    int& progress, bool& hasEntry, std::string& message)
 {
-    SaikouAnime anime;
-    int progress = 0;
-};
-
-static std::vector<ContinueWatchItem> fetch_anilist_continue_watching(
-    const std::string& token, std::string& message, size_t maxItems = 24)
-{
-    std::vector<ContinueWatchItem> items;
+    hasEntry = false;
+    progress = 0;
     if (token.empty())
     {
-        message = "Link an AniList account to sync your watching list.";
-        return items;
+        message = "Link an AniList account in Settings to sync your list.";
+        return;
     }
 
     std::string username;
     std::string libraryStatus;
     const std::vector<AniListEntry> library = fetch_anilist_library(token, username, libraryStatus);
-
     for (const AniListEntry& entry : library)
     {
-        if (entry.listStatus != "CURRENT")
-            continue;
-
-        ContinueWatchItem item;
-        item.anime = entry.anime;
-        item.progress = entry.progress;
-        item.anime.posterPath = cached_cover_path(item.anime.id);
-        items.push_back(item);
-
-        if (maxItems > 0 && items.size() >= maxItems)
+        if (entry.listStatus == "CURRENT")
+        {
+            anime = entry.anime;
+            progress = entry.progress;
+            hasEntry = true;
             break;
+        }
     }
-
-    if (!items.empty())
-        message = "Watching on AniList  |  @" + username;
-    else
-        message = "@" + username + " is linked. No Watching entries yet.";
-
-    return items;
+    message = hasEntry
+        ? ("Episode " + std::to_string(progress) + " in progress  |  @" + username)
+        : ("@" + username + " is linked. No Watching entries yet.");
 }
-
-static std::vector<ContinueWatchItem> load_local_continue_watching(size_t maxItems = 24)
-{
-    std::vector<ContinueWatchItem> items;
-    FILE* file = std::fopen(kLocalContinuePath, "r");
-    if (!file)
-        return items;
-
-    ContinueWatchItem legacy;
-    bool sawLegacy = false;
-    std::map<int, ContinueWatchItem> byIndex;
-    char line[2048] = {};
-
-    while (std::fgets(line, sizeof(line), file))
-    {
-        std::string value(line);
-        while (!value.empty() && (value.back() == '\n' || value.back() == '\r'))
-            value.pop_back();
-
-        const size_t split = value.find('=');
-        if (split == std::string::npos)
-            continue;
-
-        const std::string key = value.substr(0, split);
-        const std::string data = value.substr(split + 1);
-
-        auto parseIndexed = [&](const std::string& prefix, int& index, std::string& field) -> bool {
-            if (key.rfind(prefix, 0) != 0)
-                return false;
-            const size_t dot = key.find('.', prefix.size());
-            if (dot == std::string::npos)
-                return false;
-            index = std::atoi(key.substr(prefix.size(), dot - prefix.size()).c_str());
-            field = key.substr(dot + 1);
-            return index >= 0 && index < static_cast<int>(kLocalContinueCapacity);
-        };
-
-        int index = 0;
-        std::string field;
-        if (parseIndexed("item", index, field))
-        {
-            ContinueWatchItem& item = byIndex[index];
-            if (field == "id")
-                item.anime.id = std::atoi(data.c_str());
-            else if (field == "title")
-                item.anime.title = data;
-            else if (field == "coverUrl")
-                item.anime.coverUrl = data;
-            else if (field == "episodes")
-                item.anime.episodes = std::atoi(data.c_str());
-            else if (field == "progress")
-                item.progress = std::atoi(data.c_str());
-            continue;
-        }
-
-        // Backward compatibility with the original single-entry file format.
-        sawLegacy = true;
-        if (key == "id")
-            legacy.anime.id = std::atoi(data.c_str());
-        else if (key == "title")
-            legacy.anime.title = data;
-        else if (key == "coverUrl")
-            legacy.anime.coverUrl = data;
-        else if (key == "episodes")
-            legacy.anime.episodes = std::atoi(data.c_str());
-        else if (key == "progress")
-            legacy.progress = std::atoi(data.c_str());
-    }
-
-    std::fclose(file);
-
-    if (sawLegacy && legacy.anime.id > 0 && !legacy.anime.title.empty())
-    {
-        legacy.anime.posterPath = cached_cover_path(legacy.anime.id);
-        items.push_back(legacy);
-    }
-
-    for (const auto& entry : byIndex)
-    {
-        if (entry.second.anime.id <= 0 || entry.second.anime.title.empty())
-            continue;
-
-        ContinueWatchItem item = entry.second;
-        item.anime.posterPath = cached_cover_path(item.anime.id);
-        items.push_back(item);
-
-        if (maxItems > 0 && items.size() >= maxItems)
-            break;
-    }
-
-    return items;
-}
-
-// Called by the future video-player path whenever playback actually starts/resumes.
-// Upserts the title, keeps the newest progress, and caps local history at 24 titles.
-static bool save_local_continue_watching(const ContinueWatchItem& item)
-{
-    if (item.anime.id <= 0 || item.anime.title.empty())
-        return false;
-
-    std::vector<ContinueWatchItem> items = load_local_continue_watching(0);
-    bool replaced = false;
-
-    for (ContinueWatchItem& existing : items)
-    {
-        if (existing.anime.id != item.anime.id)
-            continue;
-
-        existing = item;
-        replaced = true;
-        break;
-    }
-
-    if (!replaced)
-        items.insert(items.begin(), item);
-
-    if (items.size() > kLocalContinueCapacity)
-        items.resize(kLocalContinueCapacity);
-
-    mkdir("sdmc:/switch", 0777);
-    mkdir("sdmc:/switch/SaikouTV", 0777);
-
-    FILE* file = std::fopen(kLocalContinuePath, "w");
-    if (!file)
-        return false;
-
-    for (size_t i = 0; i < items.size() && i < kLocalContinueCapacity; ++i)
-    {
-        const ContinueWatchItem& current = items[i];
-        std::fprintf(file, "item%zu.id=%d\n", i, current.anime.id);
-        std::fprintf(file, "item%zu.title=%s\n", i, current.anime.title.c_str());
-        std::fprintf(file, "item%zu.coverUrl=%s\n", i, current.anime.coverUrl.c_str());
-        std::fprintf(file, "item%zu.episodes=%d\n", i, current.anime.episodes);
-        std::fprintf(file, "item%zu.progress=%d\n", i, current.progress);
-    }
-
-    std::fclose(file);
-    return true;
-}
-
-
-class TrendingCatalogActivity;
-static TrendingCatalogActivity* g_trendingCatalogActivity = nullptr;
-
-static brls::Box* make_home_load_more_card(std::function<void()> callback)
-{
-    brls::Box* card = new brls::Box(brls::Axis::COLUMN);
-    card->setWidth(184.0f);
-    card->setHeight(244.0f);
-    card->setPadding(10.0f);
-    card->setMargins(3, 7, 3, 0);
-    card->setBackgroundColor(nvgRGB(27, 34, 48));
-    card->setBorderColor(nvgRGB(48, 57, 74));
-    card->setBorderThickness(1.0f);
-    card->setCornerRadius(9.0f);
-    card->setFocusable(true);
-    card->setJustifyContent(brls::JustifyContent::CENTER);
-    card->setAlignItems(brls::AlignItems::CENTER);
-
-    brls::Label* label = new brls::Label();
-    label->setText("LOAD MORE");
-    label->setFontSize(16.0f);
-    label->setTextColor(nvgRGB(244, 246, 250));
-    label->setSingleLine(false);
-    label->setFocusable(false);
-    card->addView(label);
-
-    card->registerAction("Load more trending anime", brls::BUTTON_A, [callback](brls::View*) {
-        callback();
-        return true;
-    });
-    return card;
-}
-
-static void render_home_trending_cards(
-    brls::Box* container,
-    const std::vector<SaikouAnime>& items,
-    std::function<void()> loadMoreCallback)
-{
-    if (!container) return;
-    clear_box(container);
-
-    const float itemWidth = 192.0f;
-    const float contentWidth =
-        std::max(1160.0f, static_cast<float>(items.size() + 1) * itemWidth);
-    container->setWidth(contentWidth);
-
-    brls::Box* row = new brls::Box(brls::Axis::ROW);
-    row->setWidth(contentWidth);
-    row->setHeight(252.0f);
-    row->setAlignItems(brls::AlignItems::FLEX_START);
-
-    for (const SaikouAnime& anime : items)
-        row->addView(make_anime_card(anime));
-
-    row->addView(make_home_load_more_card(std::move(loadMoreCallback)));
-    container->addView(row);
-}
-
-class TrendingCatalogActivity : public brls::Activity
-{
-public:
-    TrendingCatalogActivity()
-    {
-        g_trendingCatalogActivity = this;
-    }
-
-    ~TrendingCatalogActivity() override
-    {
-        m_coverLifetime->store(false, std::memory_order_release);
-
-        if (m_worker.joinable())
-            m_worker.join();
-        if (m_coverWorker.joinable())
-            m_coverWorker.join();
-
-        if (g_trendingCatalogActivity == this)
-            g_trendingCatalogActivity = nullptr;
-    }
-
-    brls::View* createContentView() override
-    {
-        brls::Box* root = new brls::Box(brls::Axis::COLUMN);
-        register_page_back_action(root);
-        root->setWidthPercentage(100.0f);
-        root->setHeightPercentage(100.0f);
-        root->setPadding(30.0f);
-        root->setBackgroundColor(nvgRGB(16, 20, 29));
-
-        brls::Label* heading = new brls::Label();
-        heading->setText("TRENDING ANIME");
-        heading->setFontSize(30.0f);
-        heading->setTextColor(nvgRGB(244, 246, 250));
-        root->addView(heading);
-
-        m_status = new brls::Label();
-        m_status->setText("Loading trending anime...");
-        m_status->setFontSize(14.0f);
-        m_status->setTextColor(nvgRGB(174, 184, 200));
-        m_status->setMargins(0, 7, 0, 0);
-        root->addView(m_status);
-
-        m_scroll = new brls::ScrollingFrame();
-        m_scroll->setWidthPercentage(100.0f);
-        m_scroll->setHeight(600.0f);
-        m_scroll->setMargins(0, 12, 0, 0);
-        m_scroll->setScrollingBehavior(brls::ScrollingBehavior::NATURAL);
-
-        m_grid = new brls::Box(brls::Axis::COLUMN);
-        m_grid->setWidth(1160.0f);
-        m_grid->setHeight(900.0f);
-        m_scroll->setContentView(m_grid);
-        root->addView(m_scroll);
-        return root;
-    }
-
-    void onContentAvailable() override
-    {
-        start_load(1);
-    }
-
-    void tick()
-    {
-        if (m_ready.load(std::memory_order_acquire))
-        {
-            if (m_worker.joinable())
-                m_worker.join();
-
-            append_loaded_items();
-            m_ready.store(false, std::memory_order_release);
-            m_loading = false;
-
-            if (m_status)
-            {
-                std::string label = "Loaded " +
-                    std::to_string(m_items.size()) + " trending anime";
-                if (m_hasMore)
-                    label += " — select LOAD MORE for another 30";
-                else
-                    label += " — end of results";
-                m_status->setText(label);
-            }
-        }
-
-        start_pending_cover_worker();
-    }
-
-private:
-    struct CoverJob
-    {
-        brls::Image* image = nullptr;
-        std::string url;
-        std::string path;
-    };
-
-    brls::Label* m_status = nullptr;
-    brls::ScrollingFrame* m_scroll = nullptr;
-    brls::Box* m_grid = nullptr;
-
-    std::vector<SaikouAnime> m_items;
-    std::thread m_worker;
-    std::thread m_coverWorker;
-    std::atomic<bool> m_ready{ false };
-    std::shared_ptr<std::atomic<bool>> m_coverLifetime =
-        std::make_shared<std::atomic<bool>>(true);
-
-    std::vector<CoverJob> m_pendingCoverJobs;
-    size_t m_coverCompleted = 0;
-    size_t m_coverTotal = 0;
-    bool m_coverWorkerDone = true;
-
-    bool m_loading = false;
-    bool m_hasMore = true;
-    int m_page = 0;
-    size_t m_renderedCount = 0;
-
-    void start_load(int page)
-    {
-        if (m_loading || !m_hasMore)
-            return;
-
-        if (m_worker.joinable())
-            m_worker.join();
-
-        m_loading = true;
-        m_ready.store(false, std::memory_order_release);
-
-        m_worker = std::thread([this, page] {
-            std::string status;
-            std::vector<SaikouAnime> newItems =
-                fetch_anilist_trending_page(page, 30, status);
-
-            for (SaikouAnime& anime : newItems)
-                anime.posterPath = cached_cover_path(anime.id);
-
-            if (newItems.size() < 30)
-                m_hasMore = false;
-
-            m_items.insert(m_items.end(), newItems.begin(), newItems.end());
-            m_page = page;
-            m_ready.store(true, std::memory_order_release);
-        });
-    }
-
-    void append_loaded_items()
-    {
-        if (!m_grid)
-            return;
-
-        constexpr size_t perRow = 6;
-        constexpr float rowWidth = 1160.0f;
-        constexpr float rowHeight = 252.0f;
-
-        size_t index = m_renderedCount;
-
-        // The Load More row stays alive while fetching metadata. Remove it only
-        // after the new metadata is ready, and move focus off it first if needed.
-        if (!m_grid->getChildren().empty() && m_renderedCount > 0)
-        {
-            brls::View* last = m_grid->getChildren().back();
-            brls::Box* moreRow = dynamic_cast<brls::Box*>(last);
-            if (moreRow && moreRow->getChildren().size() == 1 &&
-                moreRow->getChildren().front()->isFocusable())
-            {
-                brls::View* currentFocus =
-                    brls::Application::getCurrentFocus();
-                if (currentFocus == moreRow->getChildren().front())
-                {
-                    const auto& rows = m_grid->getChildren();
-                    if (rows.size() >= 2)
-                    {
-                        brls::Box* previousRow =
-                            dynamic_cast<brls::Box*>(rows[rows.size() - 2]);
-                        if (previousRow && !previousRow->getChildren().empty())
-                            brls::Application::giveFocus(
-                                previousRow->getChildren().back());
-                    }
-                }
-
-                m_grid->removeView(moreRow);
-            }
-        }
-
-        while (index < m_items.size())
-        {
-            brls::Box* row = nullptr;
-
-            if (!m_grid->getChildren().empty())
-            {
-                brls::View* last = m_grid->getChildren().back();
-                row = dynamic_cast<brls::Box*>(last);
-                if (row && row->getChildren().size() >= perRow)
-                    row = nullptr;
-            }
-
-            if (!row)
-            {
-                row = new brls::Box(brls::Axis::ROW);
-                row->setWidth(rowWidth);
-                row->setHeight(rowHeight);
-                row->setAlignItems(brls::AlignItems::FLEX_START);
-                m_grid->addView(row);
-            }
-
-            while (index < m_items.size() &&
-                   row->getChildren().size() < perRow)
-            {
-                brls::Image* image = nullptr;
-                row->addView(
-                    make_anime_card(m_items[index], std::string(), &image));
-
-                struct stat st;
-                const std::string path =
-                    cached_cover_path(m_items[index].id);
-                if (image && !m_items[index].coverUrl.empty() &&
-                    (stat(path.c_str(), &st) != 0 || st.st_size <= 256))
-                {
-                    m_pendingCoverJobs.push_back(
-                        { image, m_items[index].coverUrl, path });
-                }
-
-                ++index;
-            }
-        }
-
-        m_renderedCount = m_items.size();
-
-        if (m_hasMore)
-        {
-            brls::Box* moreRow = new brls::Box(brls::Axis::ROW);
-            moreRow->setWidth(rowWidth);
-            moreRow->setHeight(rowHeight);
-            moreRow->setAlignItems(brls::AlignItems::FLEX_START);
-
-            moreRow->addView(make_home_load_more_card([this] {
-                start_load(m_page + 1);
-            }));
-            m_grid->addView(moreRow);
-        }
-
-        const size_t dataRows =
-            (m_renderedCount + perRow - 1) / perRow;
-        const size_t totalRows = dataRows + (m_hasMore ? 1 : 0);
-        m_grid->setHeight(
-            std::max(600.0f, static_cast<float>(totalRows) * rowHeight + 20.0f));
-
-        if (m_pendingCoverJobs.empty())
-        {
-            if (m_status)
-                m_status->setText("Trending ready — select a poster for details.");
-        }
-        else if (m_status)
-        {
-            m_status->setText(
-                "Loading posters: 0 / " +
-                std::to_string(m_pendingCoverJobs.size()));
-        }
-    }
-
-    void start_pending_cover_worker()
-    {
-        if (m_pendingCoverJobs.empty())
-            return;
-
-        if (m_coverWorker.joinable())
-        {
-            if (!m_coverWorkerDone)
-                return;
-
-            m_coverWorker.join();
-        }
-
-        std::vector<CoverJob> jobs;
-        jobs.swap(m_pendingCoverJobs);
-
-        m_coverCompleted = 0;
-        m_coverTotal = jobs.size();
-        m_coverWorkerDone = false;
-
-        const auto lifetime = m_coverLifetime;
-        perf_log_count("TRENDING PROGRESSIVE COVERS START", jobs.size());
-
-        m_coverWorker = std::thread(
-            [this, lifetime, jobs = std::move(jobs)] {
-                size_t completed = 0;
-
-                for (const CoverJob& job : jobs)
-                {
-                    if (!lifetime->load(std::memory_order_acquire))
-                        return;
-
-                    if (!download_image(job.url, job.path))
-                        continue;
-
-                    ++completed;
-
-                    brls::sync([this, lifetime, image = job.image,
-                        path = job.path, completed, total = jobs.size()] {
-                        if (!lifetime->load(std::memory_order_acquire))
-                            return;
-
-                        image->setImageFromFile(path);
-                        m_coverCompleted = completed;
-
-                        if (m_status)
-                        {
-                            m_status->setText(
-                                "Loading posters: " +
-                                std::to_string(completed) + " / " +
-                                std::to_string(total));
-                        }
-                    });
-                }
-
-                brls::sync([this, lifetime, completed, total = jobs.size()] {
-                    if (!lifetime->load(std::memory_order_acquire))
-                        return;
-
-                    m_coverCompleted = completed;
-                    m_coverWorkerDone = true;
-
-                    if (m_status)
-                    {
-                        m_status->setText(
-                            "Trending ready — " +
-                            std::to_string(completed) + " / " +
-                            std::to_string(total) + " posters loaded.");
-                    }
-
-                    perf_log_count(
-                        "TRENDING PROGRESSIVE COVERS DONE", completed);
-                });
-            });
-    }
-};
-
-
-class AiringCatalogActivity;
-static AiringCatalogActivity* g_airingCatalogActivity = nullptr;
-
-static void render_home_airing_cards(
-    brls::Box* container,
-    const std::vector<SaikouAnime>& items,
-    std::function<void()> loadMoreCallback)
-{
-    if (!container) return;
-    clear_box(container);
-
-    const float itemWidth = 192.0f;
-    const float contentWidth =
-        std::max(1160.0f, static_cast<float>(items.size() + 1) * itemWidth);
-    container->setWidth(contentWidth);
-
-    brls::Box* row = new brls::Box(brls::Axis::ROW);
-    row->setWidth(contentWidth);
-    row->setHeight(252.0f);
-    row->setAlignItems(brls::AlignItems::FLEX_START);
-
-    for (const SaikouAnime& anime : items)
-        row->addView(make_anime_card(anime));
-
-    row->addView(make_home_load_more_card(std::move(loadMoreCallback)));
-    container->addView(row);
-}
-
-class AiringCatalogActivity : public brls::Activity
-{
-public:
-    AiringCatalogActivity()
-    {
-        g_airingCatalogActivity = this;
-    }
-
-    ~AiringCatalogActivity() override
-    {
-        m_coverLifetime->store(false, std::memory_order_release);
-
-        if (m_worker.joinable())
-            m_worker.join();
-        if (m_coverWorker.joinable())
-            m_coverWorker.join();
-
-        if (g_airingCatalogActivity == this)
-            g_airingCatalogActivity = nullptr;
-    }
-
-    brls::View* createContentView() override
-    {
-        brls::Box* root = new brls::Box(brls::Axis::COLUMN);
-        register_page_back_action(root);
-        root->setWidthPercentage(100.0f);
-        root->setHeightPercentage(100.0f);
-        root->setPadding(30.0f);
-        root->setBackgroundColor(nvgRGB(16, 20, 29));
-
-        brls::Label* heading = new brls::Label();
-        heading->setText("CURRENTLY AIRING");
-        heading->setFontSize(30.0f);
-        heading->setTextColor(nvgRGB(244, 246, 250));
-        root->addView(heading);
-
-        m_status = new brls::Label();
-        m_status->setText("Loading currently airing anime...");
-        m_status->setFontSize(14.0f);
-        m_status->setTextColor(nvgRGB(174, 184, 200));
-        m_status->setMargins(0, 7, 0, 0);
-        root->addView(m_status);
-
-        m_scroll = new brls::ScrollingFrame();
-        m_scroll->setWidthPercentage(100.0f);
-        m_scroll->setHeight(600.0f);
-        m_scroll->setMargins(0, 12, 0, 0);
-        m_scroll->setScrollingBehavior(brls::ScrollingBehavior::NATURAL);
-
-        m_grid = new brls::Box(brls::Axis::COLUMN);
-        m_grid->setWidth(1160.0f);
-        m_grid->setHeight(900.0f);
-        m_scroll->setContentView(m_grid);
-        root->addView(m_scroll);
-        return root;
-    }
-
-    void onContentAvailable() override
-    {
-        start_load(1);
-    }
-
-    void tick()
-    {
-        if (m_ready.load(std::memory_order_acquire))
-        {
-            if (m_worker.joinable())
-                m_worker.join();
-
-            append_loaded_items();
-            m_ready.store(false, std::memory_order_release);
-            m_loading = false;
-
-            if (m_status)
-            {
-                std::string label = "Loaded " +
-                    std::to_string(m_items.size()) + " currently airing anime";
-                if (m_hasMore)
-                    label += " — select LOAD MORE for another 30";
-                else
-                    label += " — end of results";
-                m_status->setText(label);
-            }
-        }
-
-        start_pending_cover_worker();
-    }
-
-private:
-    struct CoverJob
-    {
-        brls::Image* image = nullptr;
-        std::string url;
-        std::string path;
-    };
-
-    brls::Label* m_status = nullptr;
-    brls::ScrollingFrame* m_scroll = nullptr;
-    brls::Box* m_grid = nullptr;
-
-    std::vector<SaikouAnime> m_items;
-    std::thread m_worker;
-    std::thread m_coverWorker;
-    std::atomic<bool> m_ready{ false };
-    std::shared_ptr<std::atomic<bool>> m_coverLifetime =
-        std::make_shared<std::atomic<bool>>(true);
-
-    std::vector<CoverJob> m_pendingCoverJobs;
-    size_t m_coverCompleted = 0;
-    size_t m_coverTotal = 0;
-    bool m_coverWorkerDone = true;
-
-    bool m_loading = false;
-    bool m_hasMore = true;
-    int m_page = 0;
-    size_t m_renderedCount = 0;
-
-    void start_load(int page)
-    {
-        if (m_loading || !m_hasMore)
-            return;
-
-        if (m_worker.joinable())
-            m_worker.join();
-
-        m_loading = true;
-        m_ready.store(false, std::memory_order_release);
-
-        m_worker = std::thread([this, page] {
-            std::string status;
-            std::vector<SaikouAnime> newItems =
-                fetch_currently_airing_page(page, 30, status);
-
-            for (SaikouAnime& anime : newItems)
-                anime.posterPath = cached_cover_path(anime.id);
-
-            if (newItems.size() < 30)
-                m_hasMore = false;
-
-            m_items.insert(m_items.end(), newItems.begin(), newItems.end());
-            m_page = page;
-            m_ready.store(true, std::memory_order_release);
-        });
-    }
-
-    void append_loaded_items()
-    {
-        if (!m_grid)
-            return;
-
-        constexpr size_t perRow = 6;
-        constexpr float rowWidth = 1160.0f;
-        constexpr float rowHeight = 252.0f;
-
-        // Remove only the previous Load More row after metadata is ready.
-        // If it was focused, move focus to a stable existing card first.
-        if (!m_grid->getChildren().empty() && m_renderedCount > 0)
-        {
-            brls::View* last = m_grid->getChildren().back();
-            brls::Box* moreRow = dynamic_cast<brls::Box*>(last);
-            if (moreRow && moreRow->getChildren().size() == 1 &&
-                moreRow->getChildren().front()->isFocusable())
-            {
-                brls::View* currentFocus =
-                    brls::Application::getCurrentFocus();
-                if (currentFocus == moreRow->getChildren().front())
-                {
-                    const auto& rows = m_grid->getChildren();
-                    if (rows.size() >= 2)
-                    {
-                        brls::Box* previousRow =
-                            dynamic_cast<brls::Box*>(rows[rows.size() - 2]);
-                        if (previousRow && !previousRow->getChildren().empty())
-                            brls::Application::giveFocus(
-                                previousRow->getChildren().back());
-                    }
-                }
-
-                m_grid->removeView(moreRow);
-            }
-        }
-
-        size_t index = m_renderedCount;
-
-        while (index < m_items.size())
-        {
-            brls::Box* row = nullptr;
-
-            if (!m_grid->getChildren().empty())
-            {
-                brls::View* last = m_grid->getChildren().back();
-                row = dynamic_cast<brls::Box*>(last);
-                if (row && row->getChildren().size() >= perRow)
-                    row = nullptr;
-            }
-
-            if (!row)
-            {
-                row = new brls::Box(brls::Axis::ROW);
-                row->setWidth(rowWidth);
-                row->setHeight(rowHeight);
-                row->setAlignItems(brls::AlignItems::FLEX_START);
-                m_grid->addView(row);
-            }
-
-            while (index < m_items.size() &&
-                   row->getChildren().size() < perRow)
-            {
-                brls::Image* image = nullptr;
-                row->addView(
-                    make_anime_card(m_items[index], std::string(), &image));
-
-                struct stat st;
-                const std::string path =
-                    cached_cover_path(m_items[index].id);
-                if (image && !m_items[index].coverUrl.empty() &&
-                    (stat(path.c_str(), &st) != 0 || st.st_size <= 256))
-                {
-                    m_pendingCoverJobs.push_back(
-                        { image, m_items[index].coverUrl, path });
-                }
-
-                ++index;
-            }
-        }
-
-        m_renderedCount = m_items.size();
-
-        if (m_hasMore)
-        {
-            brls::Box* moreRow = new brls::Box(brls::Axis::ROW);
-            moreRow->setWidth(rowWidth);
-            moreRow->setHeight(rowHeight);
-            moreRow->setAlignItems(brls::AlignItems::FLEX_START);
-
-            moreRow->addView(make_home_load_more_card([this] {
-                start_load(m_page + 1);
-            }));
-            m_grid->addView(moreRow);
-        }
-
-        const size_t dataRows =
-            (m_renderedCount + perRow - 1) / perRow;
-        const size_t totalRows = dataRows + (m_hasMore ? 1 : 0);
-        m_grid->setHeight(
-            std::max(600.0f, static_cast<float>(totalRows) * rowHeight + 20.0f));
-
-        if (m_pendingCoverJobs.empty())
-        {
-            if (m_status)
-                m_status->setText(
-                    "Currently airing ready — select a poster for details.");
-        }
-        else if (m_status)
-        {
-            m_status->setText(
-                "Loading posters: 0 / " +
-                std::to_string(m_pendingCoverJobs.size()));
-        }
-    }
-
-    void start_pending_cover_worker()
-    {
-        if (m_pendingCoverJobs.empty())
-            return;
-
-        if (m_coverWorker.joinable())
-        {
-            if (!m_coverWorkerDone)
-                return;
-
-            m_coverWorker.join();
-        }
-
-        std::vector<CoverJob> jobs;
-        jobs.swap(m_pendingCoverJobs);
-
-        m_coverCompleted = 0;
-        m_coverTotal = jobs.size();
-        m_coverWorkerDone = false;
-
-        const auto lifetime = m_coverLifetime;
-        perf_log_count("AIRING PROGRESSIVE COVERS START", jobs.size());
-
-        m_coverWorker = std::thread(
-            [this, lifetime, jobs = std::move(jobs)] {
-                size_t completed = 0;
-
-                for (const CoverJob& job : jobs)
-                {
-                    if (!lifetime->load(std::memory_order_acquire))
-                        return;
-
-                    if (!download_image(job.url, job.path))
-                        continue;
-
-                    ++completed;
-
-                    brls::sync([this, lifetime, image = job.image,
-                        path = job.path, completed, total = jobs.size()] {
-                        if (!lifetime->load(std::memory_order_acquire))
-                            return;
-
-                        image->setImageFromFile(path);
-                        m_coverCompleted = completed;
-
-                        if (m_status)
-                        {
-                            m_status->setText(
-                                "Loading posters: " +
-                                std::to_string(completed) + " / " +
-                                std::to_string(total));
-                        }
-                    });
-                }
-
-                brls::sync([this, lifetime, completed, total = jobs.size()] {
-                    if (!lifetime->load(std::memory_order_acquire))
-                        return;
-
-                    m_coverCompleted = completed;
-                    m_coverWorkerDone = true;
-
-                    if (m_status)
-                    {
-                        m_status->setText(
-                            "Currently airing ready — " +
-                            std::to_string(completed) + " / " +
-                            std::to_string(total) + " posters loaded.");
-                    }
-
-                    perf_log_count(
-                        "AIRING PROGRESSIVE COVERS DONE", completed);
-                });
-            });
-    }
-};
-
-
-class ContinueCatalogActivity;
-static ContinueCatalogActivity* g_continueCatalogActivity = nullptr;
-
-class ContinueCatalogActivity : public brls::Activity
-{
-public:
-    ContinueCatalogActivity()
-    {
-        g_continueCatalogActivity = this;
-    }
-
-    ~ContinueCatalogActivity() override
-    {
-        m_coverLifetime->store(false, std::memory_order_release);
-
-        if (m_worker.joinable())
-            m_worker.join();
-        if (m_coverWorker.joinable())
-            m_coverWorker.join();
-
-        if (g_continueCatalogActivity == this)
-            g_continueCatalogActivity = nullptr;
-    }
-
-    brls::View* createContentView() override
-    {
-        brls::Box* root = new brls::Box(brls::Axis::COLUMN);
-        register_page_back_action(root);
-        root->setWidthPercentage(100.0f);
-        root->setHeightPercentage(100.0f);
-        root->setPadding(30.0f);
-        root->setBackgroundColor(nvgRGB(16, 20, 29));
-
-        brls::Label* heading = new brls::Label();
-        heading->setText("CONTINUE WATCHING");
-        heading->setFontSize(30.0f);
-        heading->setTextColor(nvgRGB(244, 246, 250));
-        root->addView(heading);
-
-        m_status = new brls::Label();
-        m_status->setText("Loading watch history...");
-        m_status->setFontSize(14.0f);
-        m_status->setTextColor(nvgRGB(174, 184, 200));
-        m_status->setMargins(0, 7, 0, 0);
-        root->addView(m_status);
-
-        m_scroll = new brls::ScrollingFrame();
-        m_scroll->setWidthPercentage(100.0f);
-        m_scroll->setHeight(600.0f);
-        m_scroll->setMargins(0, 12, 0, 0);
-        m_scroll->setScrollingBehavior(brls::ScrollingBehavior::NATURAL);
-
-        m_grid = new brls::Box(brls::Axis::COLUMN);
-        m_grid->setWidth(1160.0f);
-        m_grid->setHeight(900.0f);
-        m_scroll->setContentView(m_grid);
-        root->addView(m_scroll);
-        return root;
-    }
-
-    void onContentAvailable() override
-    {
-        start_load();
-    }
-
-    void tick()
-    {
-        if (m_ready.load(std::memory_order_acquire))
-        {
-            if (m_worker.joinable())
-                m_worker.join();
-
-            render_first_batch();
-            m_ready.store(false, std::memory_order_release);
-            m_loading = false;
-        }
-
-        start_pending_cover_worker();
-    }
-
-private:
-    struct CoverJob
-    {
-        brls::Image* image = nullptr;
-        std::string url;
-        std::string path;
-    };
-
-    brls::Label* m_status = nullptr;
-    brls::ScrollingFrame* m_scroll = nullptr;
-    brls::Box* m_grid = nullptr;
-
-    std::vector<ContinueWatchItem> m_allItems;
-    std::thread m_worker;
-    std::thread m_coverWorker;
-    std::atomic<bool> m_ready{ false };
-    std::shared_ptr<std::atomic<bool>> m_coverLifetime =
-        std::make_shared<std::atomic<bool>>(true);
-
-    std::vector<CoverJob> m_pendingCoverJobs;
-    size_t m_renderedCount = 0;
-    size_t m_coverCompleted = 0;
-    size_t m_coverTotal = 0;
-    bool m_coverWorkerDone = true;
-
-    bool m_loading = false;
-    bool m_hasMore = false;
-
-    void start_load()
-    {
-        if (m_loading)
-            return;
-
-        m_loading = true;
-        m_ready.store(false, std::memory_order_release);
-
-        m_worker = std::thread([this] {
-            const std::string token = load_anilist_token();
-
-            if (!token.empty())
-            {
-                m_allItems =
-                    fetch_anilist_continue_watching(token, m_statusText, 0);
-
-                for (ContinueWatchItem& item : m_allItems)
-                    item.anime.posterPath = cached_cover_path(item.anime.id);
-
-                if (m_statusText.empty())
-                    m_statusText = m_allItems.empty()
-                        ? "No anime currently in your AniList watching history."
-                        : "Live AniList watch history";
-            }
-            else
-            {
-                m_allItems = load_local_continue_watching(0);
-
-                for (ContinueWatchItem& item : m_allItems)
-                    item.anime.posterPath = cached_cover_path(item.anime.id);
-
-                m_statusText = m_allItems.empty()
-                    ? "Watch something and it will appear here."
-                    : "Local watch progress on this Switch.";
-            }
-
-            m_hasMore = m_allItems.size() > 30;
-            m_ready.store(true, std::memory_order_release);
-        });
-    }
-
-    void render_first_batch()
-    {
-        clear_box(m_grid);
-        m_renderedCount = 0;
-        m_pendingCoverJobs.clear();
-        append_batch();
-    }
-
-    void append_batch()
-    {
-        if (!m_grid)
-            return;
-
-        // Remove only the previous Load More row. If it is focused, hand focus
-        // to an existing card before freeing the old row.
-        if (!m_grid->getChildren().empty() && m_renderedCount > 0)
-        {
-            brls::View* last = m_grid->getChildren().back();
-            brls::Box* moreRow = dynamic_cast<brls::Box*>(last);
-
-            if (moreRow && moreRow->getChildren().size() == 1)
-            {
-                brls::View* moreCard = moreRow->getChildren().front();
-                if (brls::Application::getCurrentFocus() == moreCard)
-                {
-                    const auto& rows = m_grid->getChildren();
-                    if (rows.size() >= 2)
-                    {
-                        brls::Box* previousRow =
-                            dynamic_cast<brls::Box*>(rows[rows.size() - 2]);
-                        if (previousRow && !previousRow->getChildren().empty())
-                            brls::Application::giveFocus(
-                                previousRow->getChildren().back());
-                    }
-                }
-
-                m_grid->removeView(moreRow);
-            }
-        }
-
-        constexpr size_t perRow = 6;
-        constexpr size_t batchSize = 30;
-        constexpr float rowWidth = 1160.0f;
-        constexpr float rowHeight = 252.0f;
-
-        const size_t start = m_renderedCount;
-        const size_t end =
-            std::min(m_allItems.size(), start + batchSize);
-
-        size_t index = start;
-        while (index < end)
-        {
-            brls::Box* row = nullptr;
-
-            if (!m_grid->getChildren().empty())
-            {
-                brls::View* last = m_grid->getChildren().back();
-                row = dynamic_cast<brls::Box*>(last);
-                if (row && row->getChildren().size() >= perRow)
-                    row = nullptr;
-            }
-
-            if (!row)
-            {
-                row = new brls::Box(brls::Axis::ROW);
-                row->setWidth(rowWidth);
-                row->setHeight(rowHeight);
-                row->setAlignItems(brls::AlignItems::FLEX_START);
-                m_grid->addView(row);
-            }
-
-            while (index < end && row->getChildren().size() < perRow)
-            {
-                ContinueWatchItem& item = m_allItems[index];
-
-                brls::Image* image = nullptr;
-                std::string subtitle =
-                    "Episode " + std::to_string(item.progress);
-                if (item.anime.episodes > 0)
-                    subtitle += " / " + std::to_string(item.anime.episodes);
-
-                row->addView(
-                    make_anime_card(item.anime, subtitle, &image));
-
-                struct stat st;
-                const std::string path = cached_cover_path(item.anime.id);
-                if (image && !item.anime.coverUrl.empty() &&
-                    (stat(path.c_str(), &st) != 0 || st.st_size <= 256))
-                {
-                    m_pendingCoverJobs.push_back(
-                        { image, item.anime.coverUrl, path });
-                }
-
-                ++index;
-            }
-        }
-
-        m_renderedCount = end;
-        m_hasMore = m_renderedCount < m_allItems.size();
-
-        if (m_hasMore)
-        {
-            brls::Box* moreRow = new brls::Box(brls::Axis::ROW);
-            moreRow->setWidth(rowWidth);
-            moreRow->setHeight(rowHeight);
-            moreRow->setAlignItems(brls::AlignItems::FLEX_START);
-
-            moreRow->addView(make_home_load_more_card([this] {
-                append_batch();
-            }));
-            m_grid->addView(moreRow);
-        }
-
-        const size_t dataRows =
-            (m_renderedCount + perRow - 1) / perRow;
-        const size_t totalRows = dataRows + (m_hasMore ? 1 : 0);
-        m_grid->setHeight(
-            std::max(600.0f, static_cast<float>(totalRows) * rowHeight + 20.0f));
-
-        if (m_status)
-        {
-            std::string label = m_statusText.empty()
-                ? "Continue Watching"
-                : m_statusText;
-
-            if (!m_pendingCoverJobs.empty())
-            {
-                label += " — Loading posters: 0 / " +
-                    std::to_string(m_pendingCoverJobs.size());
-            }
-            else if (m_hasMore)
-            {
-                label += " — select LOAD MORE for another 30";
-            }
-            else
-            {
-                label += " — " +
-                    std::to_string(m_allItems.size()) +
-                    " watch entries";
-            }
-
-            m_status->setText(label);
-        }
-    }
-
-    void start_pending_cover_worker()
-    {
-        if (m_pendingCoverJobs.empty())
-            return;
-
-        if (m_coverWorker.joinable())
-        {
-            if (!m_coverWorkerDone)
-                return;
-
-            m_coverWorker.join();
-        }
-
-        std::vector<CoverJob> jobs;
-        jobs.swap(m_pendingCoverJobs);
-
-        m_coverCompleted = 0;
-        m_coverTotal = jobs.size();
-        m_coverWorkerDone = false;
-
-        const auto lifetime = m_coverLifetime;
-        perf_log_count("CONTINUE PROGRESSIVE COVERS START", jobs.size());
-
-        m_coverWorker = std::thread(
-            [this, lifetime, jobs = std::move(jobs)] {
-                size_t completed = 0;
-
-                for (const CoverJob& job : jobs)
-                {
-                    if (!lifetime->load(std::memory_order_acquire))
-                        return;
-
-                    if (!download_image(job.url, job.path))
-                        continue;
-
-                    ++completed;
-
-                    brls::sync([this, lifetime, image = job.image,
-                        path = job.path, completed, total = jobs.size()] {
-                        if (!lifetime->load(std::memory_order_acquire))
-                            return;
-
-                        image->setImageFromFile(path);
-                        m_coverCompleted = completed;
-
-                        if (m_status)
-                        {
-                            m_status->setText(
-                                "Loading posters: " +
-                                std::to_string(completed) + " / " +
-                                std::to_string(total));
-                        }
-                    });
-                }
-
-                brls::sync([this, lifetime, completed, total = jobs.size()] {
-                    if (!lifetime->load(std::memory_order_acquire))
-                        return;
-
-                    m_coverCompleted = completed;
-                    m_coverWorkerDone = true;
-
-                    if (m_status)
-                    {
-                        std::string label = m_statusText.empty()
-                            ? "Continue Watching"
-                            : m_statusText;
-                        label += " — " + std::to_string(completed) +
-                            " / " + std::to_string(total) +
-                            " posters loaded.";
-                        if (m_hasMore)
-                            label += " Select LOAD MORE for another 30.";
-                        m_status->setText(label);
-                    }
-
-                    perf_log_count(
-                        "CONTINUE PROGRESSIVE COVERS DONE", completed);
-                });
-            });
-    }
-
-    std::string m_statusText;
-};
-
 
 class HomeActivity : public brls::Activity
 {
 public:
     ~HomeActivity() override
     {
-        m_coverLifetime->store(false, std::memory_order_release);
-
         if (m_loader.joinable())
             m_loader.join();
-        if (m_airingLoader.joinable())
-            m_airingLoader.join();
         if (m_accountLoader.joinable())
             m_accountLoader.join();
-        if (m_coverLoader.joinable())
-            m_coverLoader.join();
     }
 
     brls::View* createContentView() override
@@ -6264,15 +1875,21 @@ public:
     {
         m_status = dynamic_cast<brls::Label*>(getView("home/status"));
         m_cards = dynamic_cast<brls::Box*>(getView("home/trending/cards"));
-        m_latestCards = dynamic_cast<brls::Box*>(getView("home/latest/cards"));
         m_continueBox = dynamic_cast<brls::Box*>(getView("home/card/continue"));
-        m_continueScroll = getView("home/continue/scroll");
         m_continueTitle = dynamic_cast<brls::Label*>(getView("home/continue/title"));
         m_continueSubtitle = dynamic_cast<brls::Label*>(getView("home/continue/subtitle"));
         m_accountRevision = g_anilistAccountRevision.load(std::memory_order_acquire);
 
         if (m_continueBox)
-            m_continueBox->setFocusable(false);
+            m_continueBox->registerAction("Resume watching", brls::BUTTON_A, [this](brls::View*) {
+                log_stage("CONTINUE WATCHING ACTION");
+                if (m_hasContinue)
+                    open_anime_details(m_continueAnime);
+                else
+                    brls::Application::pushActivity(new SettingsActivity(), brls::TransitionAnimation::NONE);
+                log_stage("CONTINUE ACTION PUSH RETURNED");
+                return true;
+            });
 
         connect_navigation("nav/search", "Open Search", [] {
             brls::Application::pushActivity(new SearchActivity(), brls::TransitionAnimation::NONE);
@@ -6288,118 +1905,32 @@ public:
         if (!m_loader.joinable())
         {
             m_loader = std::thread([this] {
-                perf_log("HOME TRENDING API START");
-                m_items = fetch_anilist_media("", 24, m_loadStatus);
+                m_items = fetch_anilist_media("", 6, m_loadStatus);
                 for (SaikouAnime& anime : m_items)
+                {
                     anime.posterPath = cached_cover_path(anime.id);
-                perf_log_count("HOME TRENDING METADATA RECEIVED", m_items.size());
-
-                const std::string token = load_anilist_token();
-                if (!token.empty())
-                {
-                    perf_log("HOME CONTINUE API START");
-                    m_continueItems = fetch_anilist_continue_watching(token, m_continueMessage);
-                    for (ContinueWatchItem& item : m_continueItems)
-                        item.anime.posterPath = cached_cover_path(item.anime.id);
-                    perf_log_count("HOME CONTINUE METADATA RECEIVED", m_continueItems.size());
+                    if (!download_image(anime.coverUrl, anime.posterPath))
+                        anime.posterPath.clear();
                 }
-                else
-                {
-                    perf_log("HOME CONTINUE LOCAL START");
-                    m_continueItems = load_local_continue_watching();
-                    m_continueMessage = m_continueItems.empty()
-                        ? "Watch something and it will appear here."
-                        : "Local watch progress on this Switch.";
-                    for (ContinueWatchItem& item : m_continueItems)
-                        item.anime.posterPath = cached_cover_path(item.anime.id);
-                    perf_log_count("HOME CONTINUE LOCAL READY", m_continueItems.size());
-                }
-
+                fetch_continue_watching(load_anilist_token(), m_continueAnime,
+                    m_continueProgress, m_hasContinue, m_continueMessage);
                 m_ready.store(true, std::memory_order_release);
-                perf_log("HOME PRIMARY METADATA READY");
-            });
-        }
-        if (m_latestCards && !m_airingLoader.joinable())
-        {
-            m_airingLoader = std::thread([this] {
-                perf_log("HOME AIRING API START");
-                m_airingItems = fetch_currently_airing_media(24, m_airingStatus);
-                for (SaikouAnime& anime : m_airingItems)
-                    anime.posterPath = cached_cover_path(anime.id);
-                perf_log_count("HOME AIRING METADATA RECEIVED", m_airingItems.size());
-
-                m_airingReady.store(true, std::memory_order_release);
-                perf_log("HOME AIRING METADATA READY");
             });
         }
     }
 
     void tick()
     {
-        // HScrollingFrame can receive focus itself when entering the section.
-        // Once its dynamic card row exists, explicitly hand focus to the first
-        // actual anime card so A/LEFT/RIGHT operate on the card, not the frame.
-        if (m_continueScroll && !m_continueItems.empty())
-        {
-            brls::View* currentFocus = brls::Application::getCurrentFocus();
-            if (currentFocus == m_continueScroll && !m_continueBox->getChildren().empty())
-            {
-                brls::View* row = m_continueBox->getChildren().front();
-                if (row)
-                {
-                    brls::View* card = row->getDefaultFocus();
-                    if (card)
-                        brls::Application::giveFocus(card);
-                }
-            }
-        }
-
         if (!m_attached && m_ready.load(std::memory_order_acquire))
         {
             if (m_loader.joinable())
                 m_loader.join();
-            render_home_trending_cards(m_cards, m_items, [] {
-                brls::Application::pushActivity(
-                    new TrendingCatalogActivity(),
-                    brls::TransitionAnimation::NONE);
-            });
-            perf_log_count("HOME TRENDING CARDS RENDERED", m_items.size());
-
-            render_continue_cards();
-            perf_log_count("HOME CONTINUE CARDS RENDERED", m_continueItems.size());
+            render_anime_cards(m_cards, m_items);
             if (m_status)
-                m_status->setText("Home ready — loading posters...");
-
+                m_status->setText(m_loadStatus + " — select a poster for details.");
+            update_continue_card();
             m_attached = true;
             log_stage("ANILIST HOME CARDS ATTACHED");
-
-            // Wait until the Airing row has also been attached so one Home
-            // cover worker can own a complete, stable set of card targets.
-            if (m_airingAttached && !m_coverStarted)
-            {
-                m_coverStarted = true;
-                start_cover_loading();
-            }
-        }
-
-        if (m_airingReady.load(std::memory_order_acquire))
-        {
-            if (m_airingLoader.joinable())
-                m_airingLoader.join();
-            render_home_airing_cards(m_latestCards, m_airingItems, [] {
-                brls::Application::pushActivity(
-                    new AiringCatalogActivity(),
-                    brls::TransitionAnimation::NONE);
-            });
-            perf_log_count("HOME AIRING CARDS RENDERED", m_airingItems.size());
-            m_airingReady.store(false, std::memory_order_release);
-            m_airingAttached = true;
-
-            if (m_attached && !m_coverStarted)
-            {
-                m_coverStarted = true;
-                start_cover_loading();
-            }
         }
 
         if (m_attached && m_accountReady.load(std::memory_order_acquire))
@@ -6418,24 +1949,8 @@ public:
             m_accountLoading = true;
             m_accountReady.store(false, std::memory_order_release);
             m_accountLoader = std::thread([this] {
-                m_continueItems.clear();
-                const std::string token = load_anilist_token();
-                if (!token.empty())
-                {
-                    m_continueItems = fetch_anilist_continue_watching(token, m_continueMessage);
-                    for (ContinueWatchItem& item : m_continueItems)
-                    {
-                        if (!download_image(item.anime.coverUrl, item.anime.posterPath))
-                            item.anime.posterPath.clear();
-                    }
-                }
-                else
-                {
-                    m_continueItems = load_local_continue_watching();
-                    m_continueMessage = m_continueItems.empty()
-                        ? "Watch something and it will appear here."
-                        : "Local watch progress on this Switch.";
-                }
+                fetch_continue_watching(load_anilist_token(), m_continueAnime,
+                    m_continueProgress, m_hasContinue, m_continueMessage);
                 m_accountReady.store(true, std::memory_order_release);
             });
         }
@@ -6443,283 +1958,30 @@ public:
 
 private:
     std::thread m_loader;
-    std::thread m_airingLoader;
     std::thread m_accountLoader;
-    std::thread m_coverLoader;
     std::atomic<bool> m_ready{ false };
-    std::atomic<bool> m_airingReady{ false };
     std::atomic<bool> m_accountReady{ false };
     bool m_attached = false;
     bool m_accountLoading = false;
-    std::vector<ContinueWatchItem> m_continueItems;
+    bool m_hasContinue = false;
+    int m_continueProgress = 0;
     unsigned int m_accountRevision = 0;
     std::vector<SaikouAnime> m_items;
-    std::vector<SaikouAnime> m_airingItems;
     SaikouAnime m_continueAnime;
     std::string m_loadStatus;
-    std::string m_airingStatus;
     std::string m_continueMessage;
     brls::Label* m_status = nullptr;
     brls::Box* m_cards = nullptr;
-    brls::Box* m_latestCards = nullptr;
-    brls::View* m_continueScroll = nullptr;
     brls::Box* m_continueBox = nullptr;
     brls::Label* m_continueTitle = nullptr;
     brls::Label* m_continueSubtitle = nullptr;
 
-    struct CoverTarget
-    {
-        int animeId = 0;
-        std::string url;
-        std::string path;
-        brls::Image* image = nullptr;
-    };
-
-    std::shared_ptr<std::atomic<bool>> m_coverLifetime =
-        std::make_shared<std::atomic<bool>>(true);
-    std::atomic<uint64_t> m_coverGeneration{ 0 };
-    std::vector<CoverTarget> m_coverTargets;
-    size_t m_coverCompleted = 0;
-    size_t m_coverTotal = 0;
-    bool m_airingAttached = false;
-    bool m_coverStarted = false;
-
-    void render_continue_cards()
-    {
-        if (!m_continueBox)
-            return;
-
-        clear_box(m_continueBox);
-
-        if (m_continueItems.empty())
-        {
-            if (m_continueTitle)
-                m_continueTitle->setText("Nothing to resume yet");
-            if (m_continueSubtitle)
-                m_continueSubtitle->setText(m_continueMessage);
-            return;
-        }
-
-        brls::Box* row = new brls::Box(brls::Axis::ROW);
-        row->setWidth(std::max(1160.0f, static_cast<float>(m_continueItems.size()) * 192.0f));
-        row->setHeight(252.0f);
-        row->setAlignItems(brls::AlignItems::FLEX_START);
-
-        for (const ContinueWatchItem& item : m_continueItems)
-        {
-            std::string subtitle = "Episode " + std::to_string(item.progress);
-            if (item.anime.episodes > 0)
-                subtitle += " / " + std::to_string(item.anime.episodes);
-            row->addView(make_anime_card(item.anime, subtitle, nullptr));
-        }
-
-        row->setDefaultFocusedIndex(0);
-        m_continueBox->setFocusable(false);
-        m_continueBox->setDefaultFocusedIndex(0);
-        if (m_continueItems.size() >= 24)
-        {
-            row->addView(make_home_load_more_card([] {
-                brls::Application::pushActivity(
-                    new ContinueCatalogActivity(),
-                    brls::TransitionAnimation::NONE);
-            }));
-        }
-
-        const size_t visibleCount = std::min<size_t>(24, m_continueItems.size());
-        const float contentWidth =
-            static_cast<float>((visibleCount + (m_continueItems.size() >= 24 ? 1 : 0)) * 192.0f);
-        row->setWidth(std::max(1160.0f, contentWidth));
-
-        m_continueBox->addView(row);
-
-        if (m_continueTitle)
-            m_continueTitle->setText("CONTINUE WATCHING");
-        if (m_continueSubtitle)
-            m_continueSubtitle->setText(m_continueMessage);
-    }
-
-    void collect_cover_targets(
-        brls::Box* container,
-        size_t expectedCount,
-        std::vector<CoverTarget>& targets)
-    {
-        if (!container)
-            return;
-
-        for (brls::View* rowView : container->getChildren())
-        {
-            brls::Box* row = dynamic_cast<brls::Box*>(rowView);
-            if (!row)
-                continue;
-
-            for (brls::View* cardView : row->getChildren())
-            {
-                if (targets.size() >= expectedCount)
-                    return;
-
-                brls::Box* card = dynamic_cast<brls::Box*>(cardView);
-                if (!card)
-                    continue;
-
-                const auto children = card->getChildren();
-                if (children.empty())
-                    continue;
-
-                brls::Image* image =
-                    dynamic_cast<brls::Image*>(children.front());
-                if (!image)
-                    continue;
-
-                targets.push_back(CoverTarget());
-                targets.back().image = image;
-            }
-        }
-    }
-
-    void start_cover_loading()
-    {
-        if (m_coverLoader.joinable())
-            m_coverLoader.join();
-
-        m_coverTargets.clear();
-        m_coverCompleted = 0;
-
-        for (const SaikouAnime& anime : m_items)
-            m_coverTargets.push_back({ anime.id, anime.coverUrl,
-                cached_cover_path(anime.id), nullptr });
-
-        for (const ContinueWatchItem& item : m_continueItems)
-            m_coverTargets.push_back({ item.anime.id, item.anime.coverUrl,
-                cached_cover_path(item.anime.id), nullptr });
-
-        for (const SaikouAnime& anime : m_airingItems)
-            m_coverTargets.push_back({ anime.id, anime.coverUrl,
-                cached_cover_path(anime.id), nullptr });
-
-        size_t offset = 0;
-        if (m_cards)
-        {
-            std::vector<CoverTarget> targets;
-            collect_cover_targets(m_cards, m_items.size(), targets);
-            for (size_t i = 0; i < targets.size() && offset + i < m_coverTargets.size(); ++i)
-                m_coverTargets[offset + i].image = targets[i].image;
-            offset += targets.size();
-        }
-
-        if (m_continueBox)
-        {
-            std::vector<CoverTarget> targets;
-            collect_cover_targets(m_continueBox, m_continueItems.size(), targets);
-            for (size_t i = 0; i < targets.size() && offset + i < m_coverTargets.size(); ++i)
-                m_coverTargets[offset + i].image = targets[i].image;
-            offset += targets.size();
-        }
-
-        if (m_latestCards)
-        {
-            std::vector<CoverTarget> targets;
-            collect_cover_targets(m_latestCards, m_airingItems.size(), targets);
-            for (size_t i = 0; i < targets.size() && offset + i < m_coverTargets.size(); ++i)
-                m_coverTargets[offset + i].image = targets[i].image;
-        }
-
-        std::vector<CoverTarget> jobs;
-        for (const CoverTarget& target : m_coverTargets)
-        {
-            if (!target.image || target.url.empty())
-                continue;
-
-            struct stat st;
-            if (stat(target.path.c_str(), &st) == 0 && st.st_size > 256)
-                continue;
-
-            jobs.push_back(target);
-        }
-
-        m_coverTotal = jobs.size();
-        if (m_coverTotal == 0)
-        {
-            if (m_status)
-                m_status->setText("Home ready — select a poster for details.");
-            return;
-        }
-
-        const uint64_t generation =
-            m_coverGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
-        const auto lifetime = m_coverLifetime;
-        const size_t totalJobs = jobs.size();
-        perf_log_count("HOME PROGRESSIVE COVERS START", totalJobs);
-
-        m_coverLoader = std::thread(
-            [this, lifetime, generation, jobs, totalJobs] {
-                size_t completed = 0;
-
-                for (const CoverTarget& job : jobs)
-                {
-                    if (!lifetime->load(std::memory_order_acquire))
-                        return;
-                    if (m_coverGeneration.load(std::memory_order_acquire) != generation)
-                        return;
-
-                    if (!download_image(job.url, job.path))
-                        continue;
-
-                    ++completed;
-                    brls::sync([this, lifetime, generation, totalJobs,
-                        image = job.image, path = job.path, completed] {
-                        if (!lifetime->load(std::memory_order_acquire))
-                            return;
-                        if (m_coverGeneration.load(std::memory_order_acquire) != generation)
-                            return;
-
-                        image->setImageFromFile(path);
-                        m_coverCompleted = completed;
-
-                        if (m_status)
-                        {
-                            m_status->setText(
-                                "Loading posters: " +
-                                std::to_string(m_coverCompleted) + " / " +
-                                std::to_string(m_coverTotal));
-                        }
-
-                        char marker[160];
-                        std::snprintf(marker, sizeof(marker),
-                            "HOME PROGRESSIVE COVER READY %zu/%zu",
-                            completed, totalJobs);
-                        perf_log(marker);
-                    });
-                }
-
-                brls::sync([this, lifetime, generation, completed] {
-                    if (!lifetime->load(std::memory_order_acquire))
-                        return;
-                    if (m_coverGeneration.load(std::memory_order_acquire) != generation)
-                        return;
-
-                    m_coverCompleted = completed;
-                    if (m_status)
-                        m_status->setText("Home ready — select a poster for details.");
-
-                    perf_log_count("HOME PROGRESSIVE COVERS DONE", completed);
-                });
-            });
-    }
-
     void update_continue_card()
     {
-        // Account changes rebuild the Continue row. Invalidate pending cover
-        // callbacks before replacing those views, then synchronize the worker
-        // before collecting the new image targets.
-        m_coverGeneration.fetch_add(1, std::memory_order_acq_rel);
-        render_continue_cards();
-
-        if (m_attached)
-        {
-            if (m_coverLoader.joinable())
-                m_coverLoader.join();
-            start_cover_loading();
-        }
+        if (m_continueTitle)
+            m_continueTitle->setText(m_hasContinue ? m_continueAnime.title : "Nothing to resume yet");
+        if (m_continueSubtitle)
+            m_continueSubtitle->setText(m_continueMessage);
     }
 
     void connect_navigation(const char* id, const char* name, std::function<void()> callback)
@@ -6751,10 +2013,6 @@ static void tick_live_ui_activities()
         log_stage("SEARCH KEYBOARD GLOBAL QUIT RESTORED");
     }
 
-    if (g_episodeListActivity)
-        g_episodeListActivity->tick();
-    if (g_episodeStreamActivity)
-        g_episodeStreamActivity->tick();
     if (g_pairingActivity)
         g_pairingActivity->tick();
     if (g_libraryActivity)
@@ -6763,10 +2021,4 @@ static void tick_live_ui_activities()
         g_searchActivity->tick();
     if (g_animeDetailsActivity)
         g_animeDetailsActivity->tick();
-    if (g_trendingCatalogActivity)
-        g_trendingCatalogActivity->tick();
-    if (g_airingCatalogActivity)
-        g_airingCatalogActivity->tick();
-    if (g_continueCatalogActivity)
-        g_continueCatalogActivity->tick();
 }
