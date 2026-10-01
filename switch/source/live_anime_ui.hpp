@@ -1596,6 +1596,7 @@ static std::vector<std::string> provider_search_titles(const SaikouAnime& anime)
 }
 
 
+static std::string strip_ep_suffix(const std::string& path){ size_t p=path.rfind("/ep-"); if(p==std::string::npos)return path; std::string rest=path.substr(p+4); if(rest.empty())return path; for(char ch:rest) if(!std::isdigit(static_cast<unsigned char>(ch))) return path; return path.substr(0,p); }
 static std::string ak_vrf_exchange(std::string v,const std::string&a,const std::string&b){for(char&c:v){size_t p=a.find(c);if(p!=std::string::npos)c=b[p];}return v;}
 static std::string ak_vrf_encrypt(const std::string& input){std::string v=ak_vrf_exchange(input,"AP6GeR8H0lwUz1","UAz8Gwl10P6ReH");v=crypto::base64Encode(crypto::rc4("ItFKjuWokn4ZpB",v),true,true);v=crypto::base64Encode(crypto::rc4("fOyt97QWFB3",v),true,true);v=ak_vrf_exchange(v,"1majSlPQd2M5","da1l2jSmP5QM");v=ak_vrf_exchange(v,"CPYvHj09Au3","0jHA9CPYu3v");std::reverse(v.begin(),v.end());return encode_url_component(crypto::base64Encode(crypto::rc4("736y1uTJpBLUX",v),true,true));}
 static std::string ak_attr(const std::string&s,size_t at,const std::string&key){std::string n=key+"=\"";size_t p=s.find(n,at);char q='"';if(p==std::string::npos){n=key+"='";p=s.find(n,at);q='\'';}if(p==std::string::npos)return{};p+=n.size();size_t e=s.find(q,p);return e==std::string::npos?std::string():s.substr(p,e-p);}
