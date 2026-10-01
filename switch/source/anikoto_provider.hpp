@@ -1,0 +1,687 @@
+#pragma once
+
+#include "kaa_crypto.hpp"
+
+#include <curl/curl.h>
+#include <algorithm>
+#include <cctype>
+#include <cstring>
+#include <ctime>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace anikoto {
+
+struct Episode {
+    int number = 0;
+    std::string title;
+    std::string id;
+};
+
+struct Stream {
+    std::string url;
+    std::string quality;
+    std::string type;
+    std::vector<std::string> headers;
+};
+
+namespace detail {
+struct Response { long code = 0; std::string body; };
+
+static size_t write_cb(char* p, size_t size, size_t count, void* userdata) {
+    auto* out = static_cast<std::string*>(userdata);
+    const size_t n = size * count;
+    if (out) out->append(p, n);
+    return n;
+}
+
+static std::string url_encode(const std::string& s) {
+    static const char hex[] = "0123456789ABCDEF";
+    std::string out;
+    for (unsigned char c : s) {
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~')
+            out.push_back(static_cast<char>(c));
+        else {
+            out.push_back('%');
+            out.push_back(hex[c >> 4]);
+            out.push_back(hex[c & 15]);
+        }
+    }
+    return out;
+}
+
+static Response get(const std::string& url, const std::vector<std::string>& headers = {}, long timeout = 25) {
+    Response r;
+    CURL* c = curl_easy_init();
+    if (!c) return r;
+    curl_slist* list = nullptr;
+    for (const std::string& h : headers) list = curl_slist_append(list, h.c_str());
+    curl_easy_setopt(c, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(c, CURLOPT_HTTPGET, 1L);
+    curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(c, CURLOPT_MAXREDIRS, 5L);
+    curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 8L);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT, timeout);
+    curl_easy_setopt(c, CURLOPT_USERAGENT,
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36");
+    if (list) curl_easy_setopt(c, CURLOPT_HTTPHEADER, list);
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, &r.body);
+    curl_easy_perform(c);
+    curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &r.code);
+    curl_slist_free_all(list);
+    curl_easy_cleanup(c);
+    return r;
+}
+
+static std::string trim(std::string s) {
+    size_t a = 0;
+    while (a < s.size() && std::isspace(static_cast<unsigned char>(s[a]))) ++a;
+    size_t b = s.size();
+    while (b > a && std::isspace(static_cast<unsigned char>(s[b - 1]))) --b;
+    return s.substr(a, b - a);
+}
+
+static std::string lower(std::string s) {
+    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+
+static std::string html_decode(std::string s) {
+    const std::pair<const char*, const char*> entities[] = {
+        {"&amp;", "&"}, {"&quot;", "\""}, {"&#39;", "'"}, {"&apos;", "'"},
+        {"&lt;", "<"}, {"&gt;", ">"}, {"&nbsp;", " "}
+    };
+    for (const auto& e : entities) {
+        size_t p = 0;
+        while ((p = s.find(e.first, p)) != std::string::npos) {
+            s.replace(p, std::strlen(e.first), e.second);
+            p += std::strlen(e.second);
+        }
+    }
+    return s;
+}
+
+static std::string strip_tags(const std::string& html) {
+    std::string out;
+    bool tag = false;
+    for (char c : html) {
+        if (c == '<') { tag = true; continue; }
+        if (c == '>') { tag = false; out.push_back(' '); continue; }
+        if (!tag) out.push_back(c);
+    }
+    return trim(html_decode(out));
+}
+
+static std::string tag_attr(const std::string& tag, const std::string& attr) {
+    const std::string needle = attr + "=";
+    size_t p = 0;
+    while ((p = tag.find(needle, p)) != std::string::npos) {
+        if (p > 0 && (std::isalnum(static_cast<unsigned char>(tag[p - 1])) ||
+                      tag[p - 1] == '-' || tag[p - 1] == '_')) {
+            p += needle.size();
+            continue;
+        }
+        p += needle.size();
+        while (p < tag.size() && std::isspace(static_cast<unsigned char>(tag[p]))) ++p;
+        if (p >= tag.size()) return {};
+        if (tag[p] == '"' || tag[p] == '\'') {
+            const char q = tag[p++];
+            const size_t e = tag.find(q, p);
+            return e == std::string::npos ? std::string() : html_decode(tag.substr(p, e - p));
+        }
+        size_t e = p;
+        while (e < tag.size() && !std::isspace(static_cast<unsigned char>(tag[e])) && tag[e] != '>') ++e;
+        return html_decode(tag.substr(p, e - p));
+    }
+    return {};
+}
+
+static bool has_class(const std::string& tag, const std::string& wanted) {
+    const std::string classes = " " + tag_attr(tag, "class") + " ";
+    return classes.find(" " + wanted + " ") != std::string::npos;
+}
+
+static std::string find_href_for_name(const std::string& html) {
+    size_t p = 0;
+    while ((p = html.find("<a", p)) != std::string::npos) {
+        const size_t e = html.find('>', p);
+        if (e == std::string::npos) break;
+        const std::string tag = html.substr(p, e - p + 1);
+        if (has_class(tag, "name")) {
+            const std::string href = tag_attr(tag, "href");
+            if (!href.empty()) return href;
+        }
+        p = e + 1;
+    }
+    return {};
+}
+
+static std::string find_data_id(const std::string& html) {
+    for (const char* attr : {"data-id", "data-tip"}) {
+        size_t p = 0;
+        while ((p = html.find(attr, p)) != std::string::npos) {
+            if (p > 0 && (std::isalnum(static_cast<unsigned char>(html[p - 1])) ||
+                          html[p - 1] == '-' || html[p - 1] == '_')) {
+                p += std::strlen(attr);
+                continue;
+            }
+            const size_t e = html.find('>', p);
+            if (e == std::string::npos) break;
+            const std::string tag = html.substr(html.rfind('<', p), e - html.rfind('<', p) + 1);
+            const std::string value = tag_attr(tag, attr);
+            if (!value.empty()) return value;
+            p = e + 1;
+        }
+    }
+    return {};
+}
+
+static std::string result_html(const std::string& json) {
+    size_t p = json.find("\"result\"");
+    if (p == std::string::npos) return {};
+    p = json.find(':', p);
+    if (p == std::string::npos) return {};
+    ++p;
+    while (p < json.size() && std::isspace(static_cast<unsigned char>(json[p]))) ++p;
+    if (p >= json.size() || json[p] != '"') return {};
+    std::string out;
+    bool escaped = false;
+    for (++p; p < json.size(); ++p) {
+        const char c = json[p];
+        if (escaped) {
+            switch (c) {
+                case '"': out.push_back('"'); break;
+                case '\\': out.push_back('\\'); break;
+                case '/': out.push_back('/'); break;
+                case 'n': out.push_back('\n'); break;
+                case 'r': out.push_back('\r'); break;
+                case 't': out.push_back('\t'); break;
+                case 'b': out.push_back('\b'); break;
+                case 'f': out.push_back('\f'); break;
+                default: out.push_back(c); break;
+            }
+            escaped = false;
+        } else if (c == '\\') escaped = true;
+        else if (c == '"') return out;
+        else out.push_back(c);
+    }
+    return {};
+}
+
+static std::string json_string(const std::string& json, const std::string& key) {
+    const std::string needle = "\"" + key + "\"";
+    size_t p = json.find(needle);
+    if (p == std::string::npos) return {};
+    p = json.find(':', p + needle.size());
+    if (p == std::string::npos) return {};
+    ++p;
+    while (p < json.size() && std::isspace(static_cast<unsigned char>(json[p]))) ++p;
+    if (p >= json.size() || json[p] != '"') return {};
+    std::string out;
+    bool escaped = false;
+    for (++p; p < json.size(); ++p) {
+        const char c = json[p];
+        if (escaped) {
+            if (c == 'n') out.push_back('\n');
+            else if (c == 'r') out.push_back('\r');
+            else if (c == 't') out.push_back('\t');
+            else if (c == '/') out.push_back('/');
+            else out.push_back(c);
+            escaped = false;
+        } else if (c == '\\') escaped = true;
+        else if (c == '"') return out;
+        else out.push_back(c);
+    }
+    return {};
+}
+
+static std::string resolve_url(const std::string& base, const std::string& rel) {
+    if (rel.empty()) return {};
+    if (rel.rfind("http://", 0) == 0 || rel.rfind("https://", 0) == 0) return rel;
+    const size_t scheme = base.find("://");
+    if (scheme == std::string::npos) return rel;
+    const size_t hostEnd = base.find('/', scheme + 3);
+    const std::string origin = base.substr(0, hostEnd == std::string::npos ? base.size() : hostEnd);
+    if (rel[0] == '/') return origin + rel;
+    std::string dir = base;
+    const size_t q = dir.find('?');
+    if (q != std::string::npos) dir.resize(q);
+    const size_t slash = dir.rfind('/');
+    if (slash != std::string::npos) dir.resize(slash + 1);
+    return dir + rel;
+}
+
+static std::string origin(const std::string& url) {
+    const size_t scheme = url.find("://");
+    if (scheme == std::string::npos) return {};
+    const size_t slash = url.find('/', scheme + 3);
+    return url.substr(0, slash == std::string::npos ? url.size() : slash);
+}
+
+static std::string path_only(std::string url) {
+    const size_t q = url.find('?');
+    if (q != std::string::npos) url.resize(q);
+    const size_t scheme = url.find("://");
+    const size_t slash = url.find('/', scheme == std::string::npos ? 0 : scheme + 3);
+    return slash == std::string::npos ? "/" : url.substr(slash);
+}
+
+static std::string strip_ep_suffix(std::string path) {
+    const size_t p = path.rfind("/ep-");
+    if (p == std::string::npos) return path;
+    for (size_t i = p + 4; i < path.size(); ++i)
+        if (!std::isdigit(static_cast<unsigned char>(path[i]))) return path;
+    return path.substr(0, p);
+}
+
+static std::string vrf_exchange(const std::string& in, const std::string& k1, const std::string& k2) {
+    std::string out = in;
+    for (char& c : out) {
+        const size_t p = k1.find(c);
+        if (p != std::string::npos) c = k2[p];
+    }
+    return out;
+}
+
+static std::string vrf_encrypt(const std::string& input) {
+    std::string v = input;
+    v = vrf_exchange(v, "AP6GeR8H0lwUz1", "UAz8Gwl10P6ReH");
+    v = crypto::base64Encode(crypto::rc4("ItFKjuWokn4ZpB", v), true, true);
+    v = crypto::base64Encode(crypto::rc4("fOyt97QWFB3", v), true, true);
+    v = vrf_exchange(v, "1majSlPQd2M5", "da1l2jSmP5QM");
+    v = vrf_exchange(v, "CPYvHj09Au3", "0jHA9CPYu3v");
+    std::reverse(v.begin(), v.end());
+    v = crypto::base64Encode(crypto::rc4("736y1uTJpBLUX", v), true, true);
+    return url_encode(v);
+}
+
+struct Server { std::string type; std::string id; std::string name; };
+
+static std::vector<Server> parse_servers(const std::string& html) {
+    std::vector<Server> out;
+    std::set<std::string> seen;
+    size_t p = 0;
+    while ((p = html.find("data-link-id=", p)) != std::string::npos) {
+        const size_t tagStart = html.rfind('<', p);
+        const size_t tagEnd = html.find('>', p);
+        if (tagStart == std::string::npos || tagEnd == std::string::npos) break;
+        const std::string tag = html.substr(tagStart, tagEnd - tagStart + 1);
+        const std::string id = tag_attr(tag, "data-link-id");
+        if (id.empty() || seen.count(id)) { p = tagEnd + 1; continue; }
+
+        std::string name;
+        const size_t close = html.find("</", tagEnd + 1);
+        if (close != std::string::npos) name = strip_tags(html.substr(tagEnd + 1, close - tagEnd - 1));
+        if (name.empty()) name = "Server";
+
+        std::string type = tag_attr(tag, "data-type");
+        if (type.empty()) {
+            const size_t parent = html.rfind("<div", tagStart);
+            if (parent != std::string::npos) {
+                const size_t pe = html.find('>', parent);
+                if (pe != std::string::npos && pe < tagStart) {
+                    const std::string parentTag = html.substr(parent, pe - parent + 1);
+                    type = tag_attr(parentTag, "data-type");
+                    if (type.empty() && parentTag.find("type") != std::string::npos) {
+                        const size_t label = html.find("<label", parent);
+                        if (label != std::string::npos && label < tagStart) {
+                            const size_t le = html.find('>', label);
+                            const size_t lc = le == std::string::npos ? std::string::npos : html.find("</label>", le);
+                            if (le != std::string::npos && lc != std::string::npos && lc < tagStart)
+                                type = strip_tags(html.substr(le + 1, lc - le - 1));
+                        }
+                    }
+                }
+            }
+        }
+        if (type.empty()) type = "Sub";
+        out.push_back({trim(type), id, trim(name)});
+        seen.insert(id);
+        p = tagEnd + 1;
+    }
+    return out;
+}
+
+static std::string parse_server_embed(const std::string& base, const Server& s, const std::string& epUrl) {
+    if (s.id.rfind("http://", 0) == 0 || s.id.rfind("https://", 0) == 0) return s.id;
+    const Response r = get(base + "/ajax/server?get=" + url_encode(s.id), {
+        "Accept: application/json, text/javascript, */*; q=0.01",
+        "Referer: " + base + epUrl,
+        "X-Requested-With: XMLHttpRequest"
+    });
+    if (r.code < 200 || r.code >= 300) return {};
+    const std::string result = result_html(r.body);
+    return json_string(result, "url");
+}
+
+static std::string mega_source(const std::string& embed) {
+    const Response page = get(embed, {
+        "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "X-Requested-With: XMLHttpRequest"
+    });
+    if (page.code < 200 || page.code >= 300) return {};
+
+    std::string mediaId;
+    size_t p = 0;
+    while ((p = page.body.find("data-id=", p)) != std::string::npos) {
+        const size_t e = page.body.find('>', p);
+        if (e == std::string::npos) break;
+        const size_t start = page.body.rfind('<', p);
+        if (start == std::string::npos) break;
+        mediaId = tag_attr(page.body.substr(start, e - start + 1), "data-id");
+        if (!mediaId.empty()) break;
+        p = e + 1;
+    }
+    if (mediaId.empty()) return {};
+
+    const std::string o = origin(embed);
+    if (o.empty()) return {};
+    std::string api = o + "/stream/getSources?id=" + url_encode(mediaId);
+    const size_t sp = embed.find("?s=");
+    if (sp != std::string::npos) {
+        std::string s = embed.substr(sp + 3);
+        const size_t amp = s.find('&');
+        if (amp != std::string::npos) s.resize(amp);
+        if (!s.empty()) api += "&s=" + url_encode(s);
+    }
+
+    const Response source = get(api, {
+        "Accept: application/json,*/*",
+        "X-Requested-With: XMLHttpRequest",
+        "Referer: " + embed
+    });
+    if (source.code < 200 || source.code >= 300) return {};
+
+    std::string m3u8;
+    const std::string enc = json_string(source.body, "enc");
+    if (!enc.empty()) {
+        try {
+            std::string key = "i?LMTAx0Q6,:}50U";
+            key.resize(32, '\0');
+            const std::string raw = crypto::base64Decode(enc);
+            if (!raw.empty() && raw.size() % 16 == 0)
+                m3u8 = json_string(
+                    crypto::aesCbcDecrypt(raw, key, "W0;27ToaUpl_P%'c"), "file");
+        } catch (...) {}
+    }
+    if (m3u8.empty()) {
+        const size_t s0 = source.body.find("\"sources\"");
+        if (s0 != std::string::npos) {
+            const size_t f = source.body.find("\"file\"", s0);
+            if (f != std::string::npos) m3u8 = json_string(source.body.substr(f), "file");
+        }
+    }
+    if (m3u8.empty()) m3u8 = json_string(source.body, "file");
+    if (m3u8.empty()) return {};
+    m3u8 = resolve_url(embed, m3u8);
+
+    const std::string low = lower(m3u8);
+    if (low.find("?token=") == std::string::npos && low.find("&token=") == std::string::npos) {
+        for (size_t i = 0; i + 67 < low.size(); ++i) {
+            if (low[i] != '/') continue;
+            bool a = true, b = true;
+            for (size_t k = i + 1; k < i + 33; ++k)
+                a = a && std::isxdigit(static_cast<unsigned char>(low[k]));
+            for (size_t k = i + 34; k < i + 66; ++k)
+                b = b && std::isxdigit(static_cast<unsigned char>(low[k]));
+            if (a && b && low[i + 33] == '/' && low[i + 66] == '/') {
+                const std::string pathKey = low.substr(i + 1, 32) + "/" + low.substr(i + 34, 32);
+                const std::string payload =
+                    std::to_string(static_cast<long long>(std::time(nullptr)) + 90) + "|" + pathKey;
+                const std::string sig = crypto::base64Encode(
+                    crypto::hmacSha256("MpCdnT0k3n!9f2K#xQ7vL5mR8wN1pY4s", payload), true, false);
+                const std::string token = crypto::base64Encode(payload, true, false) + "." + sig;
+                m3u8 += (m3u8.find('?') == std::string::npos ? "?" : "&");
+                m3u8 += "token=" + url_encode(token);
+                break;
+            }
+        }
+    }
+    return m3u8;
+}
+
+static std::string mewcdn_source(const std::string& embed) {
+    const size_t hash = embed.find('#');
+    if (hash == std::string::npos) return {};
+    const std::string raw = trim(crypto::base64Decode(embed.substr(hash + 1)));
+    if (raw.rfind("http", 0) != 0) return {};
+    std::string m3u8 = raw;
+    const Response page = get(embed, {"Referer: " + origin(embed) + "/"});
+    const size_t hm = page.body.find("var HOST_MAP");
+    if (hm != std::string::npos) {
+        const size_t ob = page.body.find('{', hm);
+        const size_t cb = ob == std::string::npos ? std::string::npos : page.body.find('}', ob);
+        if (ob != std::string::npos && cb != std::string::npos) {
+            std::vector<std::string> q;
+            const std::string map = page.body.substr(ob + 1, cb - ob - 1);
+            size_t p = 0;
+            while ((p = map.find('\'', p)) != std::string::npos) {
+                const size_t e = map.find('\'', p + 1);
+                if (e == std::string::npos) break;
+                q.push_back(map.substr(p + 1, e - p - 1));
+                p = e + 1;
+            }
+            for (size_t i = 0; i + 1 < q.size(); i += 2) {
+                const size_t at = m3u8.find(q[i]);
+                if (at != std::string::npos) { m3u8.replace(at, q[i].size(), q[i + 1]); break; }
+            }
+        }
+    }
+    return m3u8;
+}
+
+static std::vector<Stream> hls(const std::string& master, const std::string& prefix,
+                               const std::string& referer, const std::vector<std::string>& extraHeaders) {
+    const Response r = get(master, {"Referer: " + referer});
+    std::vector<Stream> out;
+    if (r.code < 200 || r.code >= 300) {
+        out.push_back({master, "Auto", prefix, extraHeaders});
+        return out;
+    }
+    std::vector<std::string> lines;
+    size_t p = 0;
+    while (p < r.body.size()) {
+        const size_t e = r.body.find('\n', p);
+        lines.push_back(trim(r.body.substr(p, e == std::string::npos ? std::string::npos : e - p)));
+        p = e == std::string::npos ? r.body.size() : e + 1;
+    }
+    bool masterPlaylist = false;
+    for (const std::string& line : lines)
+        if (line.find("#EXT-X-STREAM-INF") != std::string::npos) masterPlaylist = true;
+    if (!masterPlaylist) {
+        out.push_back({master, "Auto", prefix, extraHeaders});
+        return out;
+    }
+    for (size_t i = 0; i < lines.size(); ++i) {
+        if (lines[i].find("#EXT-X-STREAM-INF") == std::string::npos) continue;
+        std::string resolution;
+        const size_t rp = lines[i].find("RESOLUTION=");
+        if (rp != std::string::npos) {
+            size_t q = rp + 11;
+            if (q < lines[i].size() && lines[i][q] == '"') ++q;
+            const size_t end = lines[i].find('"', q);
+            resolution = lines[i].substr(q, end == std::string::npos ? std::string::npos : end - q);
+        }
+        std::string variant;
+        for (size_t k = i + 1; k < lines.size(); ++k) {
+            if (lines[k].empty() || lines[k][0] == '#') continue;
+            variant = lines[k];
+            break;
+        }
+        if (variant.empty()) continue;
+        const size_t x = resolution.find('x');
+        const std::string quality = x == std::string::npos ? "Auto" : resolution.substr(x + 1) + "p";
+        out.push_back({resolve_url(master, variant), quality, prefix, extraHeaders});
+    }
+    if (out.empty()) out.push_back({master, "Auto", prefix, extraHeaders});
+    return out;
+}
+
+static std::string search_path(const std::string& title, const std::string& base) {
+    const std::string vrf = vrf_encrypt(title);
+    const std::string url = base + "/filter?keyword=" + url_encode(title) +
+        "&page=1&vrf=" + url_encode(vrf);
+    const Response r = get(url, {"Referer: " + base + "/"});
+    if (r.code < 200 || r.code >= 300) return {};
+    return resolve_url(url, find_href_for_name(r.body));
+}
+
+} // namespace detail
+
+inline std::vector<Episode> fetch_episodes(const std::string& title, const std::string& base, std::string& status) {
+    const std::string search = detail::search_path(title, base);
+    if (search.empty()) { status = "Search returned no result."; return {}; }
+
+    const detail::Response page = detail::get(search, {"Referer: " + base + "/"});
+    if (page.code < 200 || page.code >= 300) { status = "Anime page request failed."; return {}; }
+
+    const std::string animeId = detail::find_data_id(page.body);
+    if (animeId.empty()) { status = "Anime ID was not found on the source page."; return {}; }
+
+    const std::string path = detail::strip_ep_suffix(detail::path_only(search));
+    const std::string vrf = detail::vrf_encrypt(animeId);
+    const detail::Response eps = detail::get(
+        base + "/ajax/episode/list/" + detail::url_encode(animeId) + "?vrf=" + detail::url_encode(vrf),
+        {
+            "Accept: application/json, text/javascript, */*; q=0.01",
+            "Referer: " + base + path,
+            "X-Requested-With: XMLHttpRequest"
+        });
+    if (eps.code < 200 || eps.code >= 300) {
+        status = "Episode list request failed (HTTP " + std::to_string(eps.code) + ").";
+        return {};
+    }
+
+    const std::string body = detail::result_html(eps.body);
+    if (body.empty()) { status = "Episode endpoint returned no HTML."; return {}; }
+
+    std::vector<Episode> out;
+    size_t p = 0;
+    std::set<int> seen;
+    while ((p = body.find("<a", p)) != std::string::npos) {
+        const size_t e = body.find('>', p);
+        if (e == std::string::npos) break;
+        const std::string tag = body.substr(p, e - p + 1);
+        const std::string epNum = detail::tag_attr(tag, "data-num");
+        const std::string ids = detail::tag_attr(tag, "data-ids");
+        if (!epNum.empty() && !ids.empty()) {
+            const int number = std::atoi(epNum.c_str());
+            if (number > 0 && !seen.count(number)) {
+                std::string titleText;
+                const size_t close = body.find("</a>", e);
+                if (close != std::string::npos) titleText = detail::strip_tags(body.substr(e + 1, close - e - 1));
+                Episode ep;
+                ep.number = number;
+                ep.title = "Episode " + std::to_string(number);
+                if (!titleText.empty() && titleText != ep.title) ep.title += ": " + titleText;
+                ep.id = ids + "&epurl=" + path + "/ep-" + std::to_string(number);
+                const std::string mal = detail::tag_attr(tag, "data-mal");
+                const std::string slug = detail::tag_attr(tag, "data-slug");
+                const std::string ts = detail::tag_attr(tag, "data-timestamp");
+                if (!mal.empty()) ep.id += "&mal=" + detail::url_encode(mal);
+                if (!slug.empty()) ep.id += "&slug=" + detail::url_encode(slug);
+                if (!ts.empty()) ep.id += "&ts=" + detail::url_encode(ts);
+                out.push_back(std::move(ep));
+                seen.insert(number);
+            }
+        }
+        p = e + 1;
+    }
+
+    std::sort(out.begin(), out.end(), [](const Episode& a, const Episode& b) { return a.number < b.number; });
+    status = out.empty() ? "Source returned no episodes." :
+        "Source returned " + std::to_string(out.size()) + " episodes.";
+    return out;
+}
+
+inline std::vector<Stream> fetch_streams(const Episode& episode, const std::string& base, std::string& status) {
+    const size_t amp = episode.id.find("&epurl=");
+    if (amp == std::string::npos) { status = "Episode has no source route."; return {}; }
+    const std::string ids = episode.id.substr(0, amp);
+    const std::string epUrl = episode.id.substr(amp + 1);
+    const size_t nextAmp = epUrl.find('&');
+    const std::string pagePath = nextAmp == std::string::npos ? epUrl.substr(7) : epUrl.substr(7, nextAmp - 7);
+
+    const detail::Response list = detail::get(base + "/ajax/server/list?servers=" + ids, {
+        "Accept: application/json, text/javascript, */*; q=0.01",
+        "Referer: " + base + pagePath,
+        "X-Requested-With: XMLHttpRequest"
+    });
+    if (list.code < 200 || list.code >= 300) {
+        status = "Server list request failed (HTTP " + std::to_string(list.code) + ").";
+        return {};
+    }
+
+    const std::string html = detail::result_html(list.body);
+    const std::vector<detail::Server> servers = detail::parse_servers(html);
+    if (servers.empty()) { status = "Source returned no server entries."; return {}; }
+
+    std::vector<Stream> out;
+    std::set<std::string> seen;
+    for (const auto& server : servers) {
+        const std::string embed = detail::parse_server_embed(base, server, pagePath);
+        if (embed.empty()) continue;
+
+        std::string m3u8;
+        std::vector<std::string> headers;
+        std::string referer = base + "/";
+        const std::string low = detail::lower(embed);
+
+        if (low.find("megaplay.") != std::string::npos && low.find("/stream/") != std::string::npos) {
+            m3u8 = detail::mega_source(embed);
+            referer = detail::origin(embed) + "/";
+            headers.push_back("Origin: " + detail::origin(embed));
+        } else if (low.find("mewcdn.online/player/plyr.php") != std::string::npos) {
+            m3u8 = detail::mewcdn_source(embed);
+            referer = "https://mewcdn.online/";
+            headers.push_back("Origin: https://mewcdn.online");
+        } else if (low.find(".m3u8") != std::string::npos) {
+            m3u8 = embed;
+            referer = base + "/";
+        }
+
+        if (m3u8.empty()) continue;
+        std::vector<Stream> variants = detail::hls(
+            m3u8, detail::trim(server.name) + " - " + detail::trim(server.type),
+            referer, headers);
+        for (auto& v : variants) {
+            v.type = detail::trim(server.name); if (!detail::trim(server.type).empty()) v.type += "  " + detail::trim(server.type);
+            v.headers.push_back("Referer: " + referer);
+            const std::string key = v.url + "|" + v.quality + "|" + v.type;
+            if (seen.insert(key).second) out.push_back(std::move(v));
+        }
+    }
+
+    status = out.empty() ? "Servers were found, but no playable streams were extracted." :
+        "Extracted " + std::to_string(out.size()) + " playable stream option(s).";
+    return out;
+}
+
+inline const char* base_for_source(int sourceId) {
+    switch (sourceId) {
+        case 0: return "https://anichi.to";
+        case 1: return "https://anikototv.to";
+        case 2: return "https://animewave.to";
+        case 3: return "https://animesogo.to";
+        case 4: return "https://animekaitv.to";
+        default: return "";
+    }
+}
+
+inline const char* name_for_source(int sourceId) {
+    switch (sourceId) {
+        case 0: return "Anichi";
+        case 1: return "Anikoto";
+        case 2: return "AniWave (Unoriginal)";
+        case 3: return "AnimeSogo";
+        case 4: return "AnimeKai (Unoriginal)";
+        default: return "Anikoto source";
+    }
+}
+
+} // namespace anikoto
