@@ -11,19 +11,35 @@
 
     <brls:Box width="auto" height="2" marginTop="9" marginBottom="12" backgroundColor="#2A3240" />
 
-    <brls:Label id="home/status" width="auto" height="auto" text="Connecting to AniList..." fontSize="14" textColor="#AEB8C8" />
-    <brls:Label width="auto" height="auto" text="Welcome back" fontSize="34" marginTop="7" textColor="#F4F6FA" />
-    <brls:Label width="auto" height="auto" text="Anime discovery, powered by AniList." fontSize="17" marginTop="2" textColor="#AEB8C8" />
+    <brls:ScrollingFrame id="home/content/scroll" width="auto" height="570" marginTop="4" scrollingBehavior="centered">
+        <brls:Box id="home/content" width="1160" height="1080" axis="column">
+            <brls:Label id="home/status" width="auto" height="auto" text="Connecting to AniList..." fontSize="14" textColor="#AEB8C8" />
+            <brls:Label width="auto" height="auto" text="Welcome back" fontSize="34" marginTop="7" textColor="#F4F6FA" />
+            <brls:Label width="auto" height="auto" text="Anime discovery, powered by AniList." fontSize="17" marginTop="2" textColor="#AEB8C8" />
 
-    <brls:Label width="auto" height="auto" text="CONTINUE WATCHING" fontSize="19" marginTop="18" textColor="#DCE4F0" />
-    <brls:Box id="home/card/continue" width="auto" height="70" axis="column" justifyContent="center" paddingLeft="18" paddingRight="18" paddingTop="8" paddingBottom="8" marginTop="7" backgroundColor="#1B2230" borderColor="#30394A" borderThickness="1" cornerRadius="10" focusable="true">
-        <brls:Label id="home/continue/title" width="auto" height="auto" text="Nothing to resume yet" fontSize="18" textColor="#F4F6FA" />
-        <brls:Label id="home/continue/subtitle" width="auto" height="auto" text="Link an AniList account in Settings to sync your list." fontSize="14" marginTop="3" textColor="#AEB8C8" />
-    </brls:Box>
+            <brls:Box width="auto" height="28" axis="row" alignItems="center" justifyContent="spaceBetween" marginTop="18">
+                <brls:Label width="auto" height="auto" text="CONTINUE WATCHING" fontSize="19" textColor="#DCE4F0" />
+                <brls:Label id="home/continue/subtitle" width="auto" height="auto" text="Watch progress" fontSize="13" textColor="#8793A6" />
+            </brls:Box>
+            <brls:HScrollingFrame id="home/continue/scroll" width="auto" height="260" marginTop="5" scrollingBehavior="centered">
+                <brls:Box id="home/card/continue" width="4760" height="260" axis="row" />
+            </brls:HScrollingFrame>
 
-    <brls:Box width="auto" height="28" axis="row" alignItems="center" justifyContent="spaceBetween" marginTop="14">
-        <brls:Label width="auto" height="auto" text="TRENDING" fontSize="19" textColor="#DCE4F0" />
-        <brls:Label width="auto" height="auto" text="Live AniList titles, posters, and scores" fontSize="13" textColor="#8793A6" />
-    </brls:Box>
-    <brls:Box id="home/trending/cards" width="auto" height="260" axis="column" marginTop="5" />
+            <brls:Box width="auto" height="28" axis="row" alignItems="center" justifyContent="spaceBetween" marginTop="14">
+                <brls:Label width="auto" height="auto" text="TRENDING" fontSize="19" textColor="#DCE4F0" />
+                <brls:Label width="auto" height="auto" text="Live AniList trending titles" fontSize="13" textColor="#8793A6" />
+            </brls:Box>
+            <brls:HScrollingFrame id="home/trending/scroll" width="auto" height="260" marginTop="5" scrollingBehavior="natural">
+                <brls:Box id="home/trending/cards" width="4760" height="260" axis="row" />
+            </brls:HScrollingFrame>
+
+            <brls:Box width="auto" height="28" axis="row" alignItems="center" justifyContent="spaceBetween" marginTop="18">
+                <brls:Label width="auto" height="auto" text="CURRENTLY AIRING" fontSize="19" textColor="#DCE4F0" />
+                <brls:Label width="auto" height="auto" text="Currently releasing on AniList" fontSize="13" textColor="#8793A6" />
+            </brls:Box>
+            <brls:HScrollingFrame id="home/latest/scroll" width="auto" height="260" marginTop="5" scrollingBehavior="natural">
+                <brls:Box id="home/latest/cards" width="4760" height="260" axis="row" />
+            </brls:HScrollingFrame>
+        </brls:Box>
+    </brls:ScrollingFrame>
 </brls:Box>
