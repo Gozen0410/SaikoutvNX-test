@@ -22,6 +22,14 @@ set(PROJECT_RESOURCES "${CMAKE_CURRENT_SOURCE_DIR}/borealis/resources")
 add_subdirectory(${BOREALIS_LIBRARY} borealis)
 
 file(GLOB_RECURSE MAIN_SRC ${CMAKE_CURRENT_SOURCE_DIR}/source/*.cpp)
+if (PLATFORM_SWITCH)
+    find_package(PkgConfig REQUIRED)
+    pkg_search_module(MPV REQUIRED mpv)
+    list(APPEND APP_PLATFORM_INCLUDE ${MPV_INCLUDE_DIRS})
+    list(APPEND APP_PLATFORM_LIB ${MPV_STATIC_LIBRARIES})
+    link_directories(${MPV_LIBRARY_DIRS})
+endif()
+
 program_target(${PROJECT_NAME} "${MAIN_SRC}")
 set_target_properties(${PROJECT_NAME} PROPERTIES CXX_STANDARD 17)
 
@@ -30,7 +38,8 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${BOREALIS_LIBRARY}/include/borealis/extern
     ${BOREALIS_LIBRARY}/lib/extern/glfw/include
-    ${BOREALIS_LIBRARY}/lib/extern/glfw/deps)
+    ${BOREALIS_LIBRARY}/lib/extern/glfw/deps
+    ${APP_PLATFORM_INCLUDE})
 
 target_compile_options(${PROJECT_NAME} PRIVATE
     -ffunction-sections
