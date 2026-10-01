@@ -1,3 +1,4 @@
+# Build trigger: rebuild the hardware-tested main baseline.
 name: Switch Homebrew
 
 on:
@@ -50,7 +51,12 @@ jobs:
       - name: Install Borealis GLFW/OpenGL dependencies
         run: |
           set -eux
-          dkp-pacman -S --needed --noconfirm switch-glfw switch-mesa switch-libdrm_nouveau switch-pkg-config switch-curl
+          dkp-pacman -S --needed --noconfirm switch-glfw switch-mesa switch-libdrm_nouveau switch-pkg-config switch-curl switch-libwebp switch-libplacebo
+          BASE_URL="https://github.com/xfangfang/wiliwili/releases/download/v0.1.0/"
+          mkdir -p /tmp/saikou-mpv
+          curl -fL "${BASE_URL}switch-ffmpeg-7.1-1-any.pkg.tar.zst" -o /tmp/saikou-mpv/switch-ffmpeg.pkg.tar.zst
+          curl -fL "${BASE_URL}switch-libmpv-0.36.0-3-any.pkg.tar.zst" -o /tmp/saikou-mpv/switch-libmpv.pkg.tar.zst
+          dkp-pacman -U --noconfirm /tmp/saikou-mpv/switch-ffmpeg.pkg.tar.zst /tmp/saikou-mpv/switch-libmpv.pkg.tar.zst
 
       - name: Configure and build
         working-directory: switch
@@ -74,5 +80,3 @@ jobs:
           path: switch/cmake-build/SaikouSwitch.nro
           if-no-files-found: error
           retention-days: 14
-
-# Isolated test build trigger.
