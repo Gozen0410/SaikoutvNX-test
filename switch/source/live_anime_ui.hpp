@@ -86,7 +86,7 @@ struct SaikouAnime
     std::string posterPath;
 };
 
-static bool g_providerEnabled[kApiSourceCount] = { true, true, true, true, true };
+static bool g_providerEnabled[kApiSourceCount] = { true };
 static std::string g_providerBaseUrl[kApiSourceCount] = {};
 static std::string g_providerFallbackBaseUrl[kApiSourceCount] = {};
 static int g_selectedApiSource = 0;
