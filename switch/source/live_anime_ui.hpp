@@ -1595,18 +1595,6 @@ static std::vector<std::string> provider_search_titles(const SaikouAnime& anime)
     return titles;
 }
 
-
-static std::string strip_ep_suffix(const std::string& path){ size_t p=path.rfind("/ep-"); if(p==std::string::npos)return path; std::string rest=path.substr(p+4); if(rest.empty())return path; for(char ch:rest) if(!std::isdigit(static_cast<unsigned char>(ch))) return path; return path.substr(0,p); }
-static std::string ak_vrf_exchange(std::string v,const std::string&a,const std::string&b){for(char&c:v){size_t p=a.find(c);if(p!=std::string::npos)c=b[p];}return v;}
-static std::string ak_vrf_encrypt(const std::string& input){std::string v=ak_vrf_exchange(input,"AP6GeR8H0lwUz1","UAz8Gwl10P6ReH");v=crypto::base64Encode(crypto::rc4("ItFKjuWokn4ZpB",v),true,true);v=crypto::base64Encode(crypto::rc4("fOyt97QWFB3",v),true,true);v=ak_vrf_exchange(v,"1majSlPQd2M5","da1l2jSmP5QM");v=ak_vrf_exchange(v,"CPYvHj09Au3","0jHA9CPYu3v");std::reverse(v.begin(),v.end());return encode_url_component(crypto::base64Encode(crypto::rc4("736y1uTJpBLUX",v),true,true));}
-static std::string ak_attr(const std::string&s,size_t at,const std::string&key){std::string n=key+"=\"";size_t p=s.find(n,at);char q='"';if(p==std::string::npos){n=key+"='";p=s.find(n,at);q='\'';}if(p==std::string::npos)return{};p+=n.size();size_t e=s.find(q,p);return e==std::string::npos?std::string():s.substr(p,e-p);}
-static std::string ak_result_html(const std::string&b){return json_string_field(b,"result");}
-static std::vector<ProviderEpisode> ak_parse_episodes(const std::string&f,const std::string&path){std::vector<ProviderEpisode>o;size_t p=0;while((p=f.find("data-num=",p))!=std::string::npos){size_t a=f.rfind("<a",p);if(a==std::string::npos){p+=9;continue;}size_t e=f.find('>',p);if(e==std::string::npos)break;std::string num=ak_attr(f,a,"data-num"),ids=ak_attr(f,a,"data-ids");if(num.empty()||ids.empty()){p=e+1;continue;}ProviderEpisode x;x.number=std::atoi(num.c_str());x.id=ids+"&epurl="+strip_ep_suffix(path)+"/ep-"+num;x.provider="AnimeKai";x.category="Sub/Dub";std::string slug=ak_attr(f,a,"data-slug"),mal=ak_attr(f,a,"data-mal"),ts=ak_attr(f,a,"data-timestamp");if(!slug.empty())x.id+="&slug="+slug;if(!mal.empty())x.id+="&mal="+mal;if(!ts.empty())x.id+="&ts="+ts;o.push_back(std::move(x));p=e+1;}std::reverse(o.begin(),o.end());return o;}
-static std::vector<std::pair<std::string,std::string>> ak_servers(const std::string&f){std::vector<std::pair<std::string,std::string>>o;size_t p=0;while((p=f.find("data-link-id=",p))!=std::string::npos){size_t a=f.rfind("<li",p);if(a==std::string::npos)a=f.rfind("<span",p);if(a==std::string::npos)a=p;std::string id=ak_attr(f,a,"data-link-id");size_t e=f.find('>',p);if(id.empty()||e==std::string::npos){p=e==std::string::npos?f.size():e+1;continue;}size_t z=f.find("</li>",e);if(z==std::string::npos||z>e+300)z=std::min(f.size(),e+250);std::string name=trim(f.substr(e+1,z-e-1));size_t lt=name.find('<');if(lt!=std::string::npos)name.resize(lt);if(name.empty())name="AnimeKai";o.push_back({id,trim(name)});p=e+1;}return o;}
-static std::vector<ProviderStream> ak_hls(const std::string&master,const std::string&server,const std::string&referer,const std::vector<std::string>&headers){std::string b;std::vector<std::string>h=headers;h.push_back("Referer: "+referer);std::vector<ProviderStream>o;if(http_request(master,nullptr,b,25,nullptr,nullptr,&h)&&b.find("#EXT-X-STREAM-INF")!=std::string::npos){size_t p=0;while((p=b.find("#EXT-X-STREAM-INF",p))!=std::string::npos){size_t le=b.find('\n',p),u=le==std::string::npos?std::string::npos:le+1;if(u!=std::string::npos){while(u<b.size()&&(b[u]=='\r'||b[u]=='\n'))u++;size_t ue=b.find('\n',u);std::string url=trim(b.substr(u,ue==std::string::npos?std::string::npos:ue-u));if(!url.empty()&&url[0]!='#'){if(url.rfind("http",0)!=0){size_t s=master.rfind('/');if(s!=std::string::npos)url=master.substr(0,s+1)+url;}int height=0;std::string info=b.substr(p,le==std::string::npos?std::string::npos:le-p);size_t rr=info.find("RESOLUTION="),xx=rr==std::string::npos?std::string::npos:info.find('x',rr);if(xx!=std::string::npos)height=std::atoi(info.c_str()+xx+1);ProviderStream v;v.url=url;v.quality=server+" - "+(height?std::to_string(height)+"p":"Auto");v.type="HLS";v.headers=headers;o.push_back(std::move(v));}}p=le==std::string::npos?b.size():le+1;}}if(o.empty()){ProviderStream v;v.url=master;v.quality=server+" - Auto";v.type="HLS";v.headers=headers;o.push_back(std::move(v));}return o;}
-static std::vector<ProviderStream> animekai_extract_server(const std::string&embed,const std::string&server){std::string page;std::vector<std::string>ph={"Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"};if(!http_request(embed,nullptr,page,25,nullptr,nullptr,&ph))return{};size_t dp=page.find("data-id=");std::string media=dp==std::string::npos?std::string():ak_attr(page,dp,"data-id");if(media.empty())return{};std::string host=kaa_host(embed),origin="https://"+host,api=origin+"/stream/getSources?id="+encode_url_component(media);size_t sp=embed.find("?s=");if(sp!=std::string::npos){size_t se=embed.find('&',sp);api+="&s="+encode_url_component(embed.substr(sp+3,se==std::string::npos?std::string::npos:se-sp-3));}std::vector<std::string>ah={"Accept: application/json,*/*","X-Requested-With: XMLHttpRequest","Referer: "+embed};std::string res;if(!http_request(api,nullptr,res,25,nullptr,nullptr,&ah))return{};std::string m=json_string_field(res,"file"),enc=json_string_field(res,"enc");if(!enc.empty()){try{std::string d=crypto::base64Decode(enc);std::string k("i?LMTAx0Q6,:}50U");k.resize(32,'\0');if(!d.empty()&&d.size()%16==0){std::string js=crypto::aesCbcDecrypt(d,k,"W0;27ToaUpl_P%'c");size_t f=js.find("\"file\""),col=f==std::string::npos?std::string::npos:js.find(':',f);if(col!=std::string::npos){size_t q=js.find('"',col+1),e=q==std::string::npos?std::string::npos:js.find('"',q+1);if(q!=std::string::npos&&e!=std::string::npos)m=js.substr(q+1,e-q-1);}}}catch(...){}}if(m.empty())return{};return ak_hls(m,server,origin+"/",{"Origin: "+origin});}
-static std::vector<ProviderStream> fetch_animekai_sources(const ProviderEpisode&ep,std::string&status){const std::string base="https://animekaitv.to";size_t p=ep.id.find("&epurl=");if(p==std::string::npos){status="AnimeKai episode route malformed.";return{};}std::string ids=ep.id.substr(0,p),epurl=substringBefore(ep.id.substr(p+7),"&"),body;std::vector<std::string>h={"Accept: application/json, text/javascript, */*; q=0.01","Referer: "+base+epurl,"X-Requested-With: XMLHttpRequest"};if(!http_request(base+"/ajax/server/list?servers="+ids,nullptr,body,25,nullptr,nullptr,&h)){status="AnimeKai server list request failed.";return{};}auto sv=ak_servers(ak_result_html(body));if(sv.empty()){status="AnimeKai returned no servers.";return{};}std::vector<ProviderStream>out;for(auto&s:sv){std::string lb;if(!http_request(base+"/ajax/server?get="+s.first,nullptr,lb,25,nullptr,nullptr,&h))continue;std::string embed=json_string_field(lb,"url");if(embed.empty())continue;auto v=animekai_extract_server(embed,s.second);out.insert(out.end(),v.begin(),v.end());}status=out.empty()?"AnimeKai servers found, but no playable streams were extracted.":"AnimeKai extracted "+std::to_string(out.size())+" stream option(s).";return out;}
-
 static std::vector<ProviderEpisode> fetch_provider_episodes(
     const SaikouAnime& anime, int sourceId, std::string& status)
 {
@@ -1754,30 +1742,6 @@ static std::vector<ProviderEpisode> fetch_provider_episodes(
             episodes = parse_provider_episode_array(
                 first_array_in_data(response, { "episodes", "response" }));
             break;
-        }
-        case ApiSourceId::AnimeKai:
-        {
-            const std::string base = "https://animekaitv.to";
-            std::string animePath, response;
-            for (const std::string& title : provider_search_titles(anime)) {
-                const std::string url = base + "/filter?keyword=" + encode_url_component(title) + "&page=1&vrf=" + ak_vrf_encrypt(title);
-                if (!http_request(url, nullptr, response, 20)) continue;
-                const std::string href = ak_first_href(response);
-                if (!href.empty()) { animePath = href; break; }
-            }
-            if (animePath.empty()) { status="AnimeKai search returned no matching show."; break; }
-            std::string detail;
-            const std::string detailUrl = base + animePath;
-            if (!http_request(detailUrl,nullptr,detail,20)) { status="AnimeKai detail request failed."; break; }
-            size_t idp=detail.find("data-id=");
-            std::string animeId=idp==std::string::npos?std::string():ak_attr(detail,idp,"data-id");
-            if(animeId.empty()){ size_t rp=detail.find("rate-box"); animeId=rp==std::string::npos?std::string():ak_attr(detail,rp,"data-id"); }
-            if(animeId.empty()){status="AnimeKai anime ID not found.";break;}
-            std::string frag;
-            const std::string epUrl=base+"/ajax/episode/list/"+animeId+"?vrf="+ak_vrf_encrypt(animeId);
-            std::vector<std::string> eh={"Accept: application/json, text/javascript, */*; q=0.01","Referer: "+detailUrl,"X-Requested-With: XMLHttpRequest};
-            if(!http_request(epUrl,nullptr,response,20,nullptr,nullptr,&eh)){status="AnimeKai episode request failed.";break;}
-            frag=ak_result_html(response); episodes=ak_parse_episodes(frag,animePath); break;
         }
         case ApiSourceId::KickAssAnime:
         {
@@ -2114,8 +2078,8 @@ public:
         m_sourceStatus->setTextColor(nvgRGB(174, 184, 200));
         m_sourceStatus->setMargins(0, 16, 0, 0);
         m_sourceStatus->setFocusable(false);
-        if (m_sourceId == static_cast<int>(ApiSourceId::KickAssAnime) ||
-            m_sourceId == static_cast<int>(ApiSourceId::AnimeKai))
+        if (m_sourceId == static_cast<int>(ApiSourceId::Miruro) ||
+            m_sourceId == static_cast<int>(ApiSourceId::KickAssAnime))
         {
             m_sourceStatus->setText(
                 "Loading available sources from " +
@@ -2150,8 +2114,8 @@ public:
         playerStatus->setFocusable(false);
         root->addView(playerStatus);
 
-        if (m_sourceId == static_cast<int>(ApiSourceId::KickAssAnime) ||
-            m_sourceId == static_cast<int>(ApiSourceId::AnimeKai))
+        if (m_sourceId == static_cast<int>(ApiSourceId::Miruro) ||
+            m_sourceId == static_cast<int>(ApiSourceId::KickAssAnime))
             start_load();
         brls::Application::giveFocus(m_focusSink);
         return root;
@@ -2249,12 +2213,7 @@ private:
         const auto lifetime = m_lifetime;
         const ProviderEpisode episode = m_providerEpisode;
         m_worker = std::thread([this, lifetime, episode] {
-            if (m_sourceId == static_cast<int>(ApiSourceId::AnimeKai))
-            {
-                perf_log("ANIMEKAI SOURCE REQUEST START");
-                m_streams = fetch_animekai_sources(episode, m_statusText);
-            }
-            else if (m_sourceId == static_cast<int>(ApiSourceId::KickAssAnime))
+            if (m_sourceId == static_cast<int>(ApiSourceId::KickAssAnime))
             {
                 perf_log("KAA SOURCE REQUEST START");
                 m_streams = fetch_kaa_sources(episode, m_statusText);
