@@ -11,6 +11,12 @@ enum class ApiSourceId : int
     Gogoanime = 2,
     Aniwatch = 3,
     HiAnime = 4,
+    KickAssAnime = 5,
+    Anichi = 6,
+    Anikoto = 7,
+    AniWave = 8,
+    AnimeSogo = 9,
+    AnimeKai = 10,
 };
 
 struct ApiSourceInfo
@@ -28,6 +34,12 @@ static constexpr ApiSourceInfo kApiSources[] =
     { ApiSourceId::Gogoanime, "Gogoanime", "gogoanime", true },
     { ApiSourceId::Aniwatch,  "Aniwatch",  "aniwatch",  true },
     { ApiSourceId::HiAnime,   "HiAnime",   "hianime",   true },
+    { ApiSourceId::KickAssAnime, "KickAssAnime", "kickassanime", true },
+    { ApiSourceId::Anichi,      "Anichi",      "anichi",      true },
+    { ApiSourceId::Anikoto,     "Anikoto",     "anikoto",     true },
+    { ApiSourceId::AniWave,     "AniWave (Unoriginal)", "aniwave", true },
+    { ApiSourceId::AnimeSogo,   "AnimeSogo",   "animesogo",   true },
+    { ApiSourceId::AnimeKai,    "AnimeKai (Unoriginal)", "animekai", true },
 };
 
 static constexpr std::size_t kApiSourceCount = sizeof(kApiSources) / sizeof(kApiSources[0]);
