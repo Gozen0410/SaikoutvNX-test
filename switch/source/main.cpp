@@ -217,6 +217,12 @@ int main(int argc, char* argv[])
     while (true)
     {
         const bool running = brls::Application::mainLoop();
+
+        // Borealis destroys the activity stack inside Application::exit() before
+        // mainLoop() returns false. Never dereference the HomeActivity after that.
+        if (!running)
+            break;
+
         log_controller_edges();
         homeActivity->tick();
         tick_live_ui_activities();
@@ -236,9 +242,6 @@ int main(int argc, char* argv[])
                 log_stage("Borealis focus after first frame: NULL");
             }
         }
-
-        if (!running)
-            break;
 
         ++frameCount;
         if (frameCount <= 10)
