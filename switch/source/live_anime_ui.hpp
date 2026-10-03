@@ -1607,7 +1607,6 @@ static std::vector<ProviderEpisode> fetch_provider_episodes(
                 episodes.size(), slug.c_str());
             log_stage(marker);
             break;
-            break;
         }
     }
 
