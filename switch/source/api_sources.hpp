@@ -29,6 +29,14 @@ inline const ApiSourceInfo* find_api_source(int id)
     return nullptr;
 }
 
+inline std::size_t api_source_index(int id)
+{
+    for (std::size_t i = 0; i < kApiSourceCount; ++i)
+        if (static_cast<int>(kApiSources[i].id) == id)
+            return i;
+    return kApiSourceCount;
+}
+
 inline const char* api_source_name(int id)
 {
     const ApiSourceInfo* source = find_api_source(id);
