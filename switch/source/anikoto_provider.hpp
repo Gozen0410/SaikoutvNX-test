@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <mutex>
 #include <ctime>
 #include <set>
 #include <string>
@@ -29,6 +30,21 @@ struct Stream {
 
 namespace detail {
 struct Response { long code = 0; std::string body; };
+
+static std::mutex& cookie_share_mutex() { static std::mutex m; return m; }
+static void cookie_share_lock(CURL*, curl_lock_data, curl_lock_access, void*) { cookie_share_mutex().lock(); }
+static void cookie_share_unlock(CURL*, curl_lock_data, void*) { cookie_share_mutex().unlock(); }
+static CURLSH* cookie_share() {
+    static CURLSH* share = [] {
+        CURLSH* h = curl_share_init();
+        if (!h) return static_cast<CURLSH*>(nullptr);
+        curl_share_setopt(h, CURLSHOPT_LOCKFUNC, cookie_share_lock);
+        curl_share_setopt(h, CURLSHOPT_UNLOCKFUNC, cookie_share_unlock);
+        curl_share_setopt(h, CURLSHOPT_SHARE, CURL_LOCK_DATA_COOKIE);
+        return h;
+    }();
+    return share;
+}
 
 static size_t write_cb(char* p, size_t size, size_t count, void* userdata) {
     auto* out = static_cast<std::string*>(userdata);
@@ -60,6 +76,10 @@ static Response get(const std::string& url, const std::vector<std::string>& head
     curl_slist* list = nullptr;
     for (const std::string& h : headers) list = curl_slist_append(list, h.c_str());
     curl_easy_setopt(c, CURLOPT_URL, url.c_str());
+    if (CURLSH* sharedCookies = cookie_share()) {
+        curl_easy_setopt(c, CURLOPT_SHARE, sharedCookies);
+        curl_easy_setopt(c, CURLOPT_COOKIEFILE, "");
+    }
     curl_easy_setopt(c, CURLOPT_HTTPGET, 1L);
     curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(c, CURLOPT_MAXREDIRS, 5L);
@@ -162,20 +182,26 @@ static std::string find_href_for_name(const std::string& html) {
 }
 
 static std::string find_data_id(const std::string& html) {
-    for (const char* attr : {"data-id", "data-tip"}) {
-        size_t p = 0;
-        while ((p = html.find(attr, p)) != std::string::npos) {
-            if (p > 0 && (std::isalnum(static_cast<unsigned char>(html[p - 1])) ||
-                          html[p - 1] == '-' || html[p - 1] == '_')) {
-                p += std::strlen(attr);
-                continue;
+    for (const std::string marker : { std::string("id=\"watch-main\""), std::string("id='watch-main'") }) {
+        const size_t at = html.find(marker);
+        if (at == std::string::npos) continue;
+        const size_t start = html.rfind('<', at), end = html.find('>', at);
+        if (start == std::string::npos || end == std::string::npos) continue;
+        const std::string id = tag_attr(html.substr(start, end - start + 1), "data-id");
+        if (!id.empty()) return id;
+    }
+    for (const char* attr : { "data-id", "data-tip" }) {
+        size_t pos = 0;
+        while ((pos = html.find(attr, pos)) != std::string::npos) {
+            if (pos > 0 && (std::isalnum(static_cast<unsigned char>(html[pos - 1])) ||
+                            html[pos - 1] == '-' || html[pos - 1] == '_')) {
+                pos += std::strlen(attr); continue;
             }
-            const size_t e = html.find('>', p);
-            if (e == std::string::npos) break;
-            const std::string tag = html.substr(html.rfind('<', p), e - html.rfind('<', p) + 1);
-            const std::string value = tag_attr(tag, attr);
+            const size_t start = html.rfind('<', pos), end = html.find('>', pos);
+            if (start == std::string::npos || end == std::string::npos) break;
+            const std::string value = tag_attr(html.substr(start, end - start + 1), attr);
             if (!value.empty()) return value;
-            p = e + 1;
+            pos = end + 1;
         }
     }
     return {};
@@ -560,7 +586,8 @@ inline std::vector<Episode> fetch_episodes(const std::string& title, const std::
     const std::string path = detail::strip_ep_suffix(detail::path_only(search));
     const std::string vrf = detail::vrf_encrypt(animeId);
     const detail::Response eps = detail::get(
-        base + "/ajax/episode/list/" + detail::url_encode(animeId) + "?vrf=" + detail::url_encode(vrf),
+        base + "/ajax/episode/list/" + detail::url_encode(animeId) +
+            "?style=grid&vrf=" + detail::url_encode(vrf),
         {
             "Accept: application/json, text/javascript, */*; q=0.01",
             "Referer: " + base + path,
@@ -621,6 +648,8 @@ inline std::vector<Stream> fetch_streams(const Episode& episode, const std::stri
     const size_t nextAmp = epUrl.find('&');
     const std::string pagePath = nextAmp == std::string::npos ? epUrl.substr(7) : epUrl.substr(7, nextAmp - 7);
 
+    // The site requires a watch-page session before its server AJAX requests.
+    detail::get(base + pagePath, { "Referer: " + base + "/" });
     const detail::Response list = detail::get(base + "/ajax/server/list?servers=" + ids, {
         "Accept: application/json, text/javascript, */*; q=0.01",
         "Referer: " + base + pagePath,
@@ -646,7 +675,8 @@ inline std::vector<Stream> fetch_streams(const Episode& episode, const std::stri
         std::string referer = base + "/";
         const std::string low = detail::lower(embed);
 
-        if (low.find("megaplay.") != std::string::npos && low.find("/stream/") != std::string::npos) {
+        if ((low.find("megaplay.") != std::string::npos || low.find("vidtube.site") != std::string::npos) &&
+            low.find("/stream/") != std::string::npos) {
             m3u8 = detail::mega_source(embed);
             referer = detail::origin(embed) + "/";
             headers.push_back("Origin: " + detail::origin(embed));
