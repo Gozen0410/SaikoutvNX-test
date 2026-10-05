@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <cstdio>
 #include <mutex>
 #include <ctime>
 #include <set>
@@ -13,9 +14,9 @@
 #include <utility>
 #include <vector>
 
-namespace anikoto {
-
 extern void saikou_debug_log(const char* stage);
+
+namespace anikoto {
 
 struct Episode {
     int number = 0;
@@ -532,7 +533,7 @@ static std::vector<Stream> hls(const std::string& master, const std::string& pre
         std::snprintf(marker, sizeof(marker),
             "ANIKOTO HLS REJECT status=%ld bytes=%zu extm3u=%d",
             r.code, r.body.size(), hasPlaylistSignature ? 1 : 0);
-        saikou_debug_log(marker);
+        ::saikou_debug_log(marker);
         return out;
     }
     std::vector<std::string> lines;
@@ -575,7 +576,7 @@ static std::vector<Stream> hls(const std::string& master, const std::string& pre
     std::snprintf(marker, sizeof(marker),
         "ANIKOTO HLS ACCEPT status=%ld bytes=%zu streams=%zu",
         r.code, r.body.size(), out.size());
-    saikou_debug_log(marker);
+    ::saikou_debug_log(marker);
     return out;
 }
 
