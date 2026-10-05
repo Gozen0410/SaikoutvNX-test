@@ -1872,7 +1872,11 @@ public:
                 [this, i, label](brls::View*) {
                     m_selectedStream = i;
                     const ProviderStream& selected = m_streams[m_selectedStream];
-                    log_stage("NATIVE PLAYER OPEN: selected scraper stream");
+                    char playerMarker[192];
+                    std::snprintf(playerMarker, sizeof(playerMarker),
+                        "NATIVE PLAYER OPEN: source=%s option=%s headers=%zu",
+                        api_source_name(m_sourceId), label.c_str(), selected.headers.size());
+                    log_stage(playerMarker);
                     brls::Application::pushActivity(
                         new SaikouMpvPlayerActivity(
                             m_anime.title,
@@ -1954,8 +1958,8 @@ private:
                 for (const anikoto::Stream& stream : found)
                     m_streams.push_back({stream.url, stream.quality, stream.type, stream.headers});
                 char marker[160];
-                std::snprintf(marker, sizeof(marker), "%s STREAMS READY count=%zu",
-                    api_source_name(m_sourceId), m_streams.size());
+                std::snprintf(marker, sizeof(marker), "%s STREAMS READY count=%zu status=%s",
+                    api_source_name(m_sourceId), m_streams.size(), m_statusText.c_str());
                 log_stage(marker);
             }
             else
