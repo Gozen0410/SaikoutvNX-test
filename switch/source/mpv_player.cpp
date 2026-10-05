@@ -7,6 +7,7 @@
 #include <GLFW/glfw3.h>
 
 #include <atomic>
+#include <cctype>
 #include <utility>
 #include <vector>
 
@@ -27,10 +28,29 @@ extern "C"
 #define nvglCreateImageFromHandle nvglCreateImageFromHandleGL3
 #endif
 
+extern void saikou_debug_log(const char* stage);
+
 namespace
 {
 constexpr int kNvgImageNoDelete = 1 << 16;
 std::atomic<bool> gFramePending{true};
+
+std::string redact_mpv_urls(std::string text)
+{
+    for (const char* scheme : { "https://", "http://" }) {
+        size_t pos = 0;
+        while ((pos = text.find(scheme, pos)) != std::string::npos) {
+            size_t end = pos;
+            while (end < text.size() && !std::isspace(static_cast<unsigned char>(text[end])) &&
+                   text[end] != '"' && text[end] != 39)
+                ++end;
+            text.replace(pos, end - pos, "[url]");
+            pos += 5;
+        }
+    }
+    if (text.size() > 220) text.resize(220);
+    return text;
+}
 
 void onMpvRenderUpdate(void*)
 {
@@ -163,6 +183,23 @@ void SaikouMpvVideoView::handleEvents()
             break;
         switch (event->event_id)
         {
+            case MPV_EVENT_LOG_MESSAGE:
+            {
+                auto* message = static_cast<mpv_event_log_message*>(event->data);
+                if (message && message->text &&
+                    (std::strcmp(message->log_level, "warn") == 0 ||
+                     std::strcmp(message->log_level, "error") == 0 ||
+                     std::strcmp(message->log_level, "fatal") == 0))
+                {
+                    char marker[320];
+                    const std::string safeText = redact_mpv_urls(message->text);
+                    std::snprintf(marker, sizeof(marker), "MPV %s %s: %s",
+                        message->log_level, message->prefix ? message->prefix : "player",
+                        safeText.c_str());
+                    saikou_debug_log(marker);
+                }
+                break;
+            }
             case MPV_EVENT_FILE_LOADED:
             {
                 int64_t value = 0;
@@ -173,6 +210,7 @@ void SaikouMpvVideoView::handleEvents()
                 m_framePending = true;
                 m_status = "Playing  |  A pause/resume  |  B back";
                 brls::Logger::info("mpv stream loaded video={}x{}", m_videoWidth, m_videoHeight);
+                saikou_debug_log("MPV FILE LOADED");
                 break;
             }
             case MPV_EVENT_END_FILE:
@@ -182,10 +220,13 @@ void SaikouMpvVideoView::handleEvents()
                 {
                     m_status = std::string("Playback error: ") + mpv_error_string(end->error);
                     brls::Logger::error("mpv playback ended with error: {}", m_status);
+                    const std::string safeStatus = redact_mpv_urls(m_status);
+                    saikou_debug_log(("MPV PLAYBACK ERROR " + safeStatus).c_str());
                 }
                 else
                 {
                     m_status = "Stream ended  |  B back";
+                    saikou_debug_log("MPV STREAM ENDED");
                 }
                 break;
             }
