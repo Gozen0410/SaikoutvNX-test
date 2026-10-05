@@ -355,8 +355,22 @@ static std::string parse_server_embed(const std::string& base, const Server& s, 
         "X-Requested-With: XMLHttpRequest"
     });
     if (r.code < 200 || r.code >= 300) return {};
-    const std::string result = result_html(r.body);
-    return json_string(result, "url");
+    // The site's server endpoint returns {"result":{"url":"..."}}. Older
+    // versions returned an HTML string, so accept both response shapes.
+    std::string embed = json_string(r.body, "url");
+    if (embed.empty()) {
+        const std::string result = result_html(r.body);
+        embed = json_string(result, "url");
+        if (embed.empty()) {
+            size_t iframe = result.find("<iframe");
+            if (iframe != std::string::npos) {
+                const size_t end = result.find('>', iframe);
+                if (end != std::string::npos)
+                    embed = tag_attr(result.substr(iframe, end - iframe + 1), "src");
+            }
+        }
+    }
+    return resolve_url(base + epUrl, embed);
 }
 
 static std::string mega_source(const std::string& embed) {
