@@ -15,6 +15,8 @@
 
 namespace anikoto {
 
+extern void saikou_debug_log(const char* stage);
+
 struct Episode {
     int number = 0;
     std::string title;
@@ -400,8 +402,12 @@ static std::string parse_server_embed(const std::string& base, const Server& s, 
 }
 
 static std::string mega_source(const std::string& embed) {
+    const std::string o = origin(embed);
+    if (o.empty()) return {};
     const Response page = get(embed, {
         "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Origin: " + o,
+        "Referer: " + o + "/",
         "X-Requested-With: XMLHttpRequest"
     });
     if (page.code < 200 || page.code >= 300) return {};
@@ -419,8 +425,6 @@ static std::string mega_source(const std::string& embed) {
     }
     if (mediaId.empty()) return {};
 
-    const std::string o = origin(embed);
-    if (o.empty()) return {};
     std::string api = o + "/stream/getSources?id=" + url_encode(mediaId);
     const size_t sp = embed.find("?s=");
     if (sp != std::string::npos) {
@@ -431,7 +435,8 @@ static std::string mega_source(const std::string& embed) {
     }
 
     const Response source = get(api, {
-        "Accept: application/json,*/*",
+        "Accept: application/json,text/plain,*/*",
+        "Origin: " + o,
         "X-Requested-With: XMLHttpRequest",
         "Referer: " + embed
     });
@@ -517,10 +522,17 @@ static std::string mewcdn_source(const std::string& embed) {
 
 static std::vector<Stream> hls(const std::string& master, const std::string& prefix,
                                const std::string& referer, const std::vector<std::string>& extraHeaders) {
-    const Response r = get(master, {"Referer: " + referer});
+    std::vector<std::string> requestHeaders = extraHeaders;
+    requestHeaders.push_back("Referer: " + referer);
+    const Response r = get(master, requestHeaders);
     std::vector<Stream> out;
-    if (r.code < 200 || r.code >= 300) {
-        out.push_back({master, "Auto", prefix, extraHeaders});
+    const bool hasPlaylistSignature = r.body.find("#EXTM3U") != std::string::npos;
+    if (r.code < 200 || r.code >= 300 || !hasPlaylistSignature) {
+        char marker[144];
+        std::snprintf(marker, sizeof(marker),
+            "ANIKOTO HLS REJECT status=%ld bytes=%zu extm3u=%d",
+            r.code, r.body.size(), hasPlaylistSignature ? 1 : 0);
+        saikou_debug_log(marker);
         return out;
     }
     std::vector<std::string> lines;
@@ -559,6 +571,11 @@ static std::vector<Stream> hls(const std::string& master, const std::string& pre
         out.push_back({resolve_url(master, variant), quality, prefix, extraHeaders});
     }
     if (out.empty()) out.push_back({master, "Auto", prefix, extraHeaders});
+    char marker[144];
+    std::snprintf(marker, sizeof(marker),
+        "ANIKOTO HLS ACCEPT status=%ld bytes=%zu streams=%zu",
+        r.code, r.body.size(), out.size());
+    saikou_debug_log(marker);
     return out;
 }
 
