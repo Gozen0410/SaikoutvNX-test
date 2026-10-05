@@ -52,6 +52,17 @@ std::string redact_mpv_urls(std::string text)
     return text;
 }
 
+const char* mpv_log_level_name(mpv_log_level level)
+{
+    switch (level)
+    {
+        case MPV_LOG_LEVEL_WARN: return "warn";
+        case MPV_LOG_LEVEL_ERROR: return "error";
+        case MPV_LOG_LEVEL_FATAL: return "fatal";
+        default: return nullptr;
+    }
+}
+
 void onMpvRenderUpdate(void*)
 {
     gFramePending.store(true, std::memory_order_release);
@@ -186,15 +197,13 @@ void SaikouMpvVideoView::handleEvents()
             case MPV_EVENT_LOG_MESSAGE:
             {
                 auto* message = static_cast<mpv_event_log_message*>(event->data);
-                if (message && message->log_level && message->text &&
-                    (std::strcmp(message->log_level, "warn") == 0 ||
-                     std::strcmp(message->log_level, "error") == 0 ||
-                     std::strcmp(message->log_level, "fatal") == 0))
+                const char* level = message ? mpv_log_level_name(message->log_level) : nullptr;
+                if (message && level && message->text)
                 {
                     char marker[320];
                     const std::string safeText = redact_mpv_urls(message->text);
                     std::snprintf(marker, sizeof(marker), "MPV %s %s: %s",
-                        message->log_level, message->prefix ? message->prefix : "player",
+                        level, message->prefix ? message->prefix : "player",
                         safeText.c_str());
                     saikou_debug_log(marker);
                 }
