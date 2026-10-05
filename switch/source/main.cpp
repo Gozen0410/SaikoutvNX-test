@@ -21,6 +21,11 @@ static void log_stage(const char* stage)
     std::fflush(g_log);
 }
 
+void saikou_debug_log(const char* stage)
+{
+    log_stage(stage);
+}
+
 static void open_debug_logs()
 {
     fsdevMountSdmc();
