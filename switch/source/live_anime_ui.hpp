@@ -3,6 +3,7 @@
 #include <borealis.hpp>
 #include <curl/curl.h>
 #include "kaa_crypto.hpp"
+#include "anikoto_provider.hpp"
 #include <switch/applets/swkbd.h>
 #include <switch/services/nifm.h>
 #include <switch.h>
@@ -1414,9 +1415,9 @@ static std::vector<std::string> provider_search_titles(const SaikouAnime& anime)
 static std::vector<ProviderEpisode> fetch_provider_episodes(
     const SaikouAnime& anime, int sourceId, std::string& status)
 {
-    if (sourceId != static_cast<int>(ApiSourceId::KickAssAnime))
+    if (!api_source_is_valid(sourceId))
     {
-        status = "This build currently supports KickAssAnime only.";
+        status = "Invalid episode provider.";
         return {};
     }
 
@@ -1608,6 +1609,44 @@ static std::vector<ProviderEpisode> fetch_provider_episodes(
             log_stage(marker);
             break;
         }
+        case ApiSourceId::Anichi:
+        case ApiSourceId::Anikoto:
+        {
+            const int sourceIndex =
+                sourceId - static_cast<int>(ApiSourceId::Anichi);
+            const char* baseUrl = anikoto::base_for_source(sourceIndex);
+            if (!baseUrl || !*baseUrl)
+            {
+                status = std::string(api_source_name(sourceId)) + " has no configured site URL.";
+                break;
+            }
+
+            for (const std::string& title : provider_search_titles(anime))
+            {
+                std::string sourceStatus;
+                const std::vector<anikoto::Episode> found =
+                    anikoto::fetch_episodes(title, baseUrl, sourceStatus);
+                if (found.empty())
+                {
+                    log_stage((std::string(api_source_name(sourceId)) +
+                        " title lookup miss; trying next AniList title").c_str());
+                    continue;
+                }
+
+                for (const anikoto::Episode& ep : found)
+                {
+                    ProviderEpisode item;
+                    item.number = ep.number;
+                    item.title = ep.title;
+                    item.id = ep.id;
+                    item.provider = api_source_name(sourceId);
+                    item.category = "Sub";
+                    episodes.push_back(std::move(item));
+                }
+                break;
+            }
+            break;
+        }
     }
 
     if (!episodes.empty())
@@ -1622,7 +1661,8 @@ static std::vector<ProviderEpisode> fetch_provider_episodes(
     }
 
     if (status.empty())
-        status = "KickAssAnime returned no episodes. Check the network and try again.";
+        status = std::string(api_source_name(sourceId)) +
+            " returned no episodes. Check the title match and network.";
     log_stage("EPISODE PROVIDER REQUEST EMPTY OR FAILED");
     return {};
 }
@@ -1753,7 +1793,9 @@ public:
         m_sourceStatus->setTextColor(nvgRGB(174, 184, 200));
         m_sourceStatus->setMargins(0, 16, 0, 0);
         m_sourceStatus->setFocusable(false);
-        if (m_sourceId == static_cast<int>(ApiSourceId::KickAssAnime))
+        if (m_sourceId == static_cast<int>(ApiSourceId::KickAssAnime) ||
+            m_sourceId == static_cast<int>(ApiSourceId::Anichi) ||
+            m_sourceId == static_cast<int>(ApiSourceId::Anikoto))
         {
             m_sourceStatus->setText(
                 "Loading available sources from " +
@@ -1788,7 +1830,9 @@ public:
         playerStatus->setFocusable(false);
         root->addView(playerStatus);
 
-        if (m_sourceId == static_cast<int>(ApiSourceId::KickAssAnime))
+        if (m_sourceId == static_cast<int>(ApiSourceId::KickAssAnime) ||
+            m_sourceId == static_cast<int>(ApiSourceId::Anichi) ||
+            m_sourceId == static_cast<int>(ApiSourceId::Anikoto))
             start_load();
         brls::Application::giveFocus(m_focusSink);
         return root;
@@ -1891,9 +1935,30 @@ private:
                 perf_log("KAA SOURCE REQUEST START");
                 m_streams = fetch_kaa_sources(episode, m_statusText);
             }
+            else if (m_sourceId == static_cast<int>(ApiSourceId::Anichi) ||
+                     m_sourceId == static_cast<int>(ApiSourceId::Anikoto))
+            {
+                const int sourceIndex =
+                    m_sourceId - static_cast<int>(ApiSourceId::Anichi);
+                const char* baseUrl = anikoto::base_for_source(sourceIndex);
+                perf_log("ANIKOTO STREAM REQUEST START");
+                anikoto::Episode sourceEpisode;
+                sourceEpisode.number = episode.number;
+                sourceEpisode.title = episode.title;
+                sourceEpisode.id = episode.id;
+                const std::vector<anikoto::Stream> found =
+                    anikoto::fetch_streams(sourceEpisode, baseUrl, m_statusText);
+                m_streams.clear();
+                for (const anikoto::Stream& stream : found)
+                    m_streams.push_back({stream.url, stream.quality, stream.type, stream.headers});
+                char marker[160];
+                std::snprintf(marker, sizeof(marker), "%s STREAMS READY count=%zu",
+                    api_source_name(m_sourceId), m_streams.size());
+                log_stage(marker);
+            }
             else
             {
-                m_statusText = "This build currently supports KickAssAnime only.";
+                m_statusText = "No stream handler is registered for this provider.";
             }
             if (!lifetime->load(std::memory_order_acquire)) return;
             m_ready.store(true, std::memory_order_release);
