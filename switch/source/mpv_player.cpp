@@ -186,7 +186,7 @@ void SaikouMpvVideoView::handleEvents()
             case MPV_EVENT_LOG_MESSAGE:
             {
                 auto* message = static_cast<mpv_event_log_message*>(event->data);
-                if (message && message->text &&
+                if (message && message->log_level && message->text &&
                     (std::strcmp(message->log_level, "warn") == 0 ||
                      std::strcmp(message->log_level, "error") == 0 ||
                      std::strcmp(message->log_level, "fatal") == 0))
