@@ -98,7 +98,7 @@ static std::string url_decode(const std::string& value) {
     return out;
 }
 
-static Response get(const std::string& url, const std::vector<std::string>& headers = {}, long timeout = 25) {
+static Response get(const std::string& url, const std::vector<std::string>& headers = {}, long timeout = 25, bool forceHttp11 = false) {
     Response r;
     CURL* c = curl_easy_init();
     if (!c) return r;
@@ -110,6 +110,9 @@ static Response get(const std::string& url, const std::vector<std::string>& head
         curl_easy_setopt(c, CURLOPT_COOKIEFILE, "");
     }
     curl_easy_setopt(c, CURLOPT_HTTPGET, 1L);
+    // The Android Anikoto extractor pins its playlist client to HTTP/1.1.
+    // Some MegaPlay CDNs return opaque error payloads over negotiated HTTP/2.
+    if (forceHttp11) curl_easy_setopt(c, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
     curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(c, CURLOPT_MAXREDIRS, 5L);
     curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 8L);
@@ -662,9 +665,15 @@ static std::vector<Stream> hls(const std::string& master, const std::string& pre
                                const char* sourceName, bool allowOpaqueMedia) {
     std::vector<std::string> requestHeaders = extraHeaders;
     requestHeaders.push_back("Referer: " + referer);
-    const Response r = get(master, requestHeaders);
+    const Response r = get(master, requestHeaders, 25, true);
     std::vector<Stream> out;
     const bool hasPlaylistSignature = r.body.find("#EXTM3U") != std::string::npos;
+    char probe[192];
+    std::snprintf(probe, sizeof(probe),
+        "%s HLS PROBE status=%ld bytes=%zu content=%s extm3u=%d host=%s",
+        sourceName, r.code, r.body.size(), r.contentType.c_str(),
+        hasPlaylistSignature ? 1 : 0, host_of(master).c_str());
+    ::saikou_debug_log(probe);
     const bool urlLooksLikePlaylist = lower(path_only(master)).find(".m3u8") != std::string::npos;
     const bool opaqueMedia = allowOpaqueMedia && r.code >= 200 && r.code < 300 && !r.body.empty() &&
         (lower(r.contentType).find("application/octet-stream") != std::string::npos ||
@@ -816,8 +825,14 @@ static std::string search_path(const std::string& title, const std::string& base
     const std::string url = base + "/filter?keyword=" + url_encode(title) +
         "&page=1&vrf=" + url_encode(vrf);
     const Response r = get(url, {"Referer: " + base + "/"});
+    const std::string href = find_href_for_name(r.body);
+    char marker[176];
+    std::snprintf(marker, sizeof(marker),
+        "%s SEARCH PROBE status=%ld bytes=%zu content=%s title_link=%d",
+        source_tag(base), r.code, r.body.size(), r.contentType.c_str(), href.empty() ? 0 : 1);
+    ::saikou_debug_log(marker);
     if (r.code < 200 || r.code >= 300) return {};
-    return resolve_url(url, find_href_for_name(r.body));
+    return resolve_url(url, href);
 }
 
 } // namespace detail
