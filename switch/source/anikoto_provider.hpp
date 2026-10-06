@@ -658,30 +658,36 @@ static std::string mewcdn_source(const std::string& embed) {
 }
 
 static std::vector<Stream> hls(const std::string& master, const std::string& prefix,
-                               const std::string& referer, const std::vector<std::string>& extraHeaders) {
+                               const std::string& referer, const std::vector<std::string>& extraHeaders,
+                               const char* sourceName, bool allowOpaqueMedia) {
     std::vector<std::string> requestHeaders = extraHeaders;
     requestHeaders.push_back("Referer: " + referer);
     const Response r = get(master, requestHeaders);
     std::vector<Stream> out;
     const bool hasPlaylistSignature = r.body.find("#EXTM3U") != std::string::npos;
     const bool urlLooksLikePlaylist = lower(path_only(master)).find(".m3u8") != std::string::npos;
-    if (r.code < 200 || r.code >= 300 || (!hasPlaylistSignature && !urlLooksLikePlaylist)) {
+    const bool opaqueMedia = allowOpaqueMedia && r.code >= 200 && r.code < 300 && !r.body.empty() &&
+        (lower(r.contentType).find("application/octet-stream") != std::string::npos ||
+         lower(r.contentType).find("video/") != std::string::npos ||
+         lower(r.contentType).find("audio/") != std::string::npos);
+    if (r.code < 200 || r.code >= 300 ||
+        (!hasPlaylistSignature && !urlLooksLikePlaylist && !opaqueMedia)) {
         char marker[224];
         std::snprintf(marker, sizeof(marker),
             "%s HLS REJECT status=%ld bytes=%zu extm3u=%d content=%s host=%s path_m3u8=%d",
-            source_tag(referer), r.code, r.body.size(), hasPlaylistSignature ? 1 : 0,
+            sourceName, r.code, r.body.size(), hasPlaylistSignature ? 1 : 0,
             r.contentType.c_str(), host_of(master).c_str(), urlLooksLikePlaylist ? 1 : 0);
         ::saikou_debug_log(marker);
         return out;
     }
     if (!hasPlaylistSignature) {
-        // Some Anichi CDN endpoints serve an MPEG-TS payload through an .m3u8
-        // route with application/octet-stream. Let libmpv probe it directly.
+        // Anikoto-family MegaPlay endpoints may expose extensionless opaque
+        // media routes instead of a text playlist. Let libmpv probe those.
         out.push_back({master, "Auto", prefix, extraHeaders});
         char marker[192];
         std::snprintf(marker, sizeof(marker),
-            "%s HLS BODY NOT PLAYLIST; PASSING URL TO MPV host=%s",
-            source_tag(referer), host_of(master).c_str());
+            "%s OPAQUE MEDIA CANDIDATE; PASSING URL TO MPV host=%s",
+            sourceName, host_of(master).c_str());
         ::saikou_debug_log(marker);
         return out;
     }
@@ -723,8 +729,8 @@ static std::vector<Stream> hls(const std::string& master, const std::string& pre
     if (out.empty()) out.push_back({master, "Auto", prefix, extraHeaders});
     char marker[144];
     std::snprintf(marker, sizeof(marker),
-        "ANIKOTO HLS ACCEPT status=%ld bytes=%zu streams=%zu",
-        r.code, r.body.size(), out.size());
+        "%s HLS ACCEPT status=%ld bytes=%zu streams=%zu",
+        sourceName, r.code, r.body.size(), out.size());
     ::saikou_debug_log(marker);
     return out;
 }
@@ -920,10 +926,12 @@ inline std::vector<Stream> fetch_streams(const Episode& episode, const std::stri
         std::string m3u8;
         std::vector<std::string> headers;
         std::string referer = base + "/";
+        bool allowOpaqueMedia = false;
         const std::string low = detail::lower(embed);
 
         if ((low.find("megaplay.") != std::string::npos || low.find("vidtube.site") != std::string::npos) &&
             low.find("/stream/") != std::string::npos) {
+            allowOpaqueMedia = true;
             m3u8 = detail::mega_source(embed, server.type);
             referer = detail::origin(embed) + "/";
             headers.push_back("Origin: " + detail::origin(embed));
@@ -951,7 +959,7 @@ inline std::vector<Stream> fetch_streams(const Episode& episode, const std::stri
         }
         std::vector<Stream> variants = detail::hls(
             m3u8, detail::trim(server.name) + " - " + detail::trim(server.type),
-            referer, headers);
+            referer, headers, detail::source_tag(base), allowOpaqueMedia);
         for (auto& v : variants) {
             v.type = detail::trim(server.name); if (!detail::trim(server.type).empty()) v.type += "  " + detail::trim(server.type);
             v.headers.push_back("Referer: " + referer);
