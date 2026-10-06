@@ -281,6 +281,7 @@ static std::string resolve_url(const std::string& base, const std::string& rel) 
     if (rel.rfind("http://", 0) == 0 || rel.rfind("https://", 0) == 0) return rel;
     const size_t scheme = base.find("://");
     if (scheme == std::string::npos) return rel;
+    if (rel.rfind("//", 0) == 0) return base.substr(0, scheme + 1) + rel;
     const size_t hostEnd = base.find('/', scheme + 3);
     const std::string origin = base.substr(0, hostEnd == std::string::npos ? base.size() : hostEnd);
     if (rel[0] == '/') return origin + rel;
@@ -475,7 +476,7 @@ static std::string mega_source(const std::string& embed, const std::string& serv
         if (!enc.empty()) {
             try {
                 std::string key = "i?LMTAx0Q6,:}50U";
-                key.resize(32, '\\0');
+                key.resize(32, '\0');
                 const std::string raw = crypto::base64Decode(enc);
                 if (!raw.empty() && raw.size() % 16 == 0)
                     result = json_string(
@@ -483,9 +484,9 @@ static std::string mega_source(const std::string& embed, const std::string& serv
             } catch (...) {}
         }
         if (result.empty()) {
-            const size_t s0 = source.body.find("\\"sources\\"");
+            const size_t s0 = source.body.find("\"sources\"");
             if (s0 != std::string::npos) {
-                const size_t f = source.body.find("\\"file\\"", s0);
+                const size_t f = source.body.find("\"file\"", s0);
                 if (f != std::string::npos) result = json_string(source.body.substr(f), "file");
             }
         }
