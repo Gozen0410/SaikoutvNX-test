@@ -96,7 +96,7 @@ SaikouMpvVideoView::SaikouMpvVideoView(std::string url, std::vector<std::string>
     mpv_set_option_string(m_mpv, "tls-verify", "no");
     mpv_set_option_string(m_mpv, "hwdec", "auto");
     // Some anime CDNs use image-like file extensions for HLS segments.
-    mpv_set_option_string(m_mpv, "demuxer-lavf-o", "extension_picky=0");
+    mpv_set_option_string(m_mpv, "demuxer-lavf-o", "extension_picky=0,force_mpegts=1");
     // KAA CDNs validate the page that produced the HLS URL. These headers must
     // follow libmpv into both the master/variant playlists and media segments.
     mpv_set_option_string(m_mpv, "http-user-agent",
