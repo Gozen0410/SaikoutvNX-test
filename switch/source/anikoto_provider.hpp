@@ -331,9 +331,9 @@ static std::vector<Server> mapper_servers(const std::string& episodeId, const st
     std::vector<Server> out;
     std::set<std::string> seen;
     size_t p = 0;
-    while ((p = response.body.find("\\"url\\"", p)) != std::string::npos) {
-        const size_t dub = response.body.rfind("\\"dub\\"", p);
-        const size_t sub = response.body.rfind("\\"sub\\"", p);
+    while ((p = response.body.find("\"url\"", p)) != std::string::npos) {
+        const size_t dub = response.body.rfind("\"dub\"", p);
+        const size_t sub = response.body.rfind("\"sub\"", p);
         const bool isDub = dub != std::string::npos && (sub == std::string::npos || dub > sub);
         const size_t colon = response.body.find(':', p + 5);
         if (colon == std::string::npos) break;
