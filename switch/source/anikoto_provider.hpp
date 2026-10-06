@@ -298,6 +298,8 @@ static std::string json_string(const std::string& json, const std::string& key) 
     return {};
 }
 
+struct Server { std::string type; std::string id; std::string name; };
+
 static std::string episode_param(const std::string& id, const std::string& name) {
     const std::string marker = "&" + name + "=";
     size_t p = id.find(marker);
@@ -419,8 +421,6 @@ static std::string vrf_encrypt(const std::string& input) {
     v = crypto::base64Encode(crypto::rc4("736y1uTJpBLUX", v), true, true);
     return url_encode(v);
 }
-
-struct Server { std::string type; std::string id; std::string name; };
 
 static std::vector<Server> parse_servers(const std::string& html) {
     std::vector<Server> out;
