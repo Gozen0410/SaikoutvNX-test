@@ -32,7 +32,11 @@ struct Stream {
 };
 
 namespace detail {
-struct Response { long code = 0; std::string body; };
+struct Response {
+    long code = 0;
+    std::string body;
+    std::string contentType;
+};
 
 static std::mutex& cookie_share_mutex() { static std::mutex m; return m; }
 static void cookie_share_lock(CURL*, curl_lock_data, curl_lock_access, void*) { cookie_share_mutex().lock(); }
@@ -96,6 +100,9 @@ static Response get(const std::string& url, const std::vector<std::string>& head
     curl_easy_setopt(c, CURLOPT_WRITEDATA, &r.body);
     curl_easy_perform(c);
     curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &r.code);
+    char* contentType = nullptr;
+    curl_easy_getinfo(c, CURLINFO_CONTENT_TYPE, &contentType);
+    if (contentType) r.contentType = contentType;
     curl_slist_free_all(list);
     curl_easy_cleanup(c);
     return r;
@@ -285,6 +292,17 @@ static std::string resolve_url(const std::string& base, const std::string& rel) 
     return dir + rel;
 }
 
+static const char* source_tag(const std::string& url) {
+    return lower(url).find("anichi") != std::string::npos ? "ANICHI" : "ANIKOTO";
+}
+
+static std::string host_of(const std::string& url) {
+    const size_t scheme = url.find("://");
+    if (scheme == std::string::npos) return {};
+    const size_t end = url.find_first_of("/?#", scheme + 3);
+    return url.substr(scheme + 3, end == std::string::npos ? std::string::npos : end - scheme - 3);
+}
+
 static std::string origin(const std::string& url) {
     const size_t scheme = url.find("://");
     if (scheme == std::string::npos) return {};
@@ -402,7 +420,7 @@ static std::string parse_server_embed(const std::string& base, const Server& s, 
     return resolve_url(base + epUrl, embed);
 }
 
-static std::string mega_source(const std::string& embed) {
+static std::string mega_source(const std::string& embed, const std::string& serverType) {
     const std::string o = origin(embed);
     if (o.empty()) return {};
     const Response page = get(embed, {
@@ -426,7 +444,17 @@ static std::string mega_source(const std::string& embed) {
     }
     if (mediaId.empty()) return {};
 
-    std::string api = o + "/stream/getSources?id=" + url_encode(mediaId);
+    std::string streamType = "sub";
+    const std::string typeLower = lower(serverType);
+    if (typeLower.find("dub") != std::string::npos) streamType = "dub";
+    else if (typeLower.find("hsub") != std::string::npos || typeLower.find("h-sub") != std::string::npos)
+        streamType = "hsub";
+    const std::string embedLower = lower(embed);
+    if (embedLower.find("/dub") != std::string::npos) streamType = "dub";
+    else if (embedLower.find("/hsub") != std::string::npos) streamType = "hsub";
+
+    std::string api = o + "/stream/getSources?id=" + url_encode(mediaId) +
+        "&id=" + url_encode(mediaId) + "&type=" + streamType + "&type=" + streamType;
     const size_t sp = embed.find("?s=");
     if (sp != std::string::npos) {
         std::string s = embed.substr(sp + 3);
@@ -435,34 +463,44 @@ static std::string mega_source(const std::string& embed) {
         if (!s.empty()) api += "&s=" + url_encode(s);
     }
 
-    const Response source = get(api, {
+    const std::vector<std::string> apiHeaders = {
         "Accept: application/json,text/plain,*/*",
         "Origin: " + o,
         "X-Requested-With: XMLHttpRequest",
         "Referer: " + embed
-    });
-    if (source.code < 200 || source.code >= 300) return {};
-
-    std::string m3u8;
-    const std::string enc = json_string(source.body, "enc");
-    if (!enc.empty()) {
-        try {
-            std::string key = "i?LMTAx0Q6,:}50U";
-            key.resize(32, '\0');
-            const std::string raw = crypto::base64Decode(enc);
-            if (!raw.empty() && raw.size() % 16 == 0)
-                m3u8 = json_string(
-                    crypto::aesCbcDecrypt(raw, key, "W0;27ToaUpl_P%'c"), "file");
-        } catch (...) {}
-    }
-    if (m3u8.empty()) {
-        const size_t s0 = source.body.find("\"sources\"");
-        if (s0 != std::string::npos) {
-            const size_t f = source.body.find("\"file\"", s0);
-            if (f != std::string::npos) m3u8 = json_string(source.body.substr(f), "file");
+    };
+    auto extractSource = [&](const Response& source) {
+        std::string result;
+        const std::string enc = json_string(source.body, "enc");
+        if (!enc.empty()) {
+            try {
+                std::string key = "i?LMTAx0Q6,:}50U";
+                key.resize(32, '\\0');
+                const std::string raw = crypto::base64Decode(enc);
+                if (!raw.empty() && raw.size() % 16 == 0)
+                    result = json_string(
+                        crypto::aesCbcDecrypt(raw, key, "W0;27ToaUpl_P%'c"), "file");
+            } catch (...) {}
         }
+        if (result.empty()) {
+            const size_t s0 = source.body.find("\\"sources\\"");
+            if (s0 != std::string::npos) {
+                const size_t f = source.body.find("\\"file\\"", s0);
+                if (f != std::string::npos) result = json_string(source.body.substr(f), "file");
+            }
+        }
+        if (result.empty()) result = json_string(source.body, "file");
+        return result;
+    };
+
+    Response source = get(api, apiHeaders);
+    std::string m3u8 = source.code >= 200 && source.code < 300 ? extractSource(source) : std::string();
+    if (m3u8.empty()) {
+        const std::string fallback = o + "/stream/getSourcesNew?id=" + url_encode(mediaId) +
+            "&id=" + url_encode(mediaId) + "&type=" + streamType + "&type=" + streamType;
+        source = get(fallback, apiHeaders);
+        if (source.code >= 200 && source.code < 300) m3u8 = extractSource(source);
     }
-    if (m3u8.empty()) m3u8 = json_string(source.body, "file");
     if (m3u8.empty()) return {};
     m3u8 = resolve_url(embed, m3u8);
 
@@ -529,10 +567,11 @@ static std::vector<Stream> hls(const std::string& master, const std::string& pre
     std::vector<Stream> out;
     const bool hasPlaylistSignature = r.body.find("#EXTM3U") != std::string::npos;
     if (r.code < 200 || r.code >= 300 || !hasPlaylistSignature) {
-        char marker[144];
+        char marker[192];
         std::snprintf(marker, sizeof(marker),
-            "ANIKOTO HLS REJECT status=%ld bytes=%zu extm3u=%d",
-            r.code, r.body.size(), hasPlaylistSignature ? 1 : 0);
+            "%s HLS REJECT status=%ld bytes=%zu extm3u=%d content=%s host=%s",
+            source_tag(referer), r.code, r.body.size(), hasPlaylistSignature ? 1 : 0,
+            r.contentType.c_str(), host_of(master).c_str());
         ::saikou_debug_log(marker);
         return out;
     }
@@ -578,6 +617,78 @@ static std::vector<Stream> hls(const std::string& master, const std::string& pre
         r.code, r.body.size(), out.size());
     ::saikou_debug_log(marker);
     return out;
+}
+
+static std::string find_m3u8_url(std::string text) {
+    size_t escaped = 0;
+    while ((escaped = text.find("\\/", escaped)) != std::string::npos) text.replace(escaped, 2, "/");
+    while ((escaped = text.find("&amp;")) != std::string::npos) text.replace(escaped, 5, "&");
+    size_t p = 0;
+    while ((p = text.find(".m3u8", p)) != std::string::npos) {
+        size_t start = p;
+        while (start > 0) {
+            const char c = text[start - 1];
+            if (std::isspace(static_cast<unsigned char>(c)) || c == '"' || c == '\'' ||
+                c == '<' || c == '>') break;
+            --start;
+        }
+        size_t end = p + 5;
+        while (end < text.size()) {
+            const char c = text[end];
+            if (std::isspace(static_cast<unsigned char>(c)) || c == '"' || c == '\'' ||
+                c == '<' || c == '>') break;
+            ++end;
+        }
+        const std::string url = text.substr(start, end - start);
+        if (url.find("://") != std::string::npos || url.rfind("//", 0) == 0) return url;
+        p += 5;
+    }
+    return {};
+}
+
+static std::string player_page_source(const std::string& embed, const std::string& serverType,
+                                      int depth = 0) {
+    if (embed.empty() || depth > 2) return {};
+    const std::string pageOrigin = origin(embed);
+    if (pageOrigin.empty()) return {};
+    const Response page = get(embed, {
+        "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Origin: " + pageOrigin,
+        "Referer: " + pageOrigin + "/"
+    });
+    if (page.code < 200 || page.code >= 300) {
+        char marker[160];
+        std::snprintf(marker, sizeof(marker), "%s PLAYER PAGE REJECT status=%ld bytes=%zu host=%s",
+            source_tag(embed), page.code, page.body.size(), host_of(embed).c_str());
+        ::saikou_debug_log(marker);
+        return {};
+    }
+
+    if (page.body.find("#EXTM3U") != std::string::npos) return embed;
+
+    const std::string dataId = find_data_id(page.body);
+    if (!dataId.empty()) {
+        const std::string result = mega_source(embed, serverType);
+        if (!result.empty()) return result;
+    }
+
+    const std::string direct = find_m3u8_url(page.body);
+    if (!direct.empty()) return resolve_url(embed, direct);
+
+    size_t p = page.body.find("<iframe");
+    if (p != std::string::npos) {
+        const size_t end = page.body.find('>', p);
+        if (end != std::string::npos) {
+            const std::string tag = page.body.substr(p, end - p + 1);
+            const std::string src = tag_attr(tag, "src");
+            if (!src.empty()) {
+                const std::string nested = resolve_url(embed, src);
+                if (host_of(nested) != host_of(embed))
+                    return player_page_source(nested, serverType, depth + 1);
+            }
+        }
+    }
+    return {};
 }
 
 static std::string search_path(const std::string& title, const std::string& base) {
@@ -695,7 +806,7 @@ inline std::vector<Stream> fetch_streams(const Episode& episode, const std::stri
 
         if ((low.find("megaplay.") != std::string::npos || low.find("vidtube.site") != std::string::npos) &&
             low.find("/stream/") != std::string::npos) {
-            m3u8 = detail::mega_source(embed);
+            m3u8 = detail::mega_source(embed, server.type);
             referer = detail::origin(embed) + "/";
             headers.push_back("Origin: " + detail::origin(embed));
         } else if (low.find("mewcdn.online/player/plyr.php") != std::string::npos) {
@@ -705,9 +816,21 @@ inline std::vector<Stream> fetch_streams(const Episode& episode, const std::stri
         } else if (low.find(".m3u8") != std::string::npos) {
             m3u8 = embed;
             referer = base + "/";
+        } else {
+            m3u8 = detail::player_page_source(embed, server.type);
+            referer = detail::origin(embed) + "/";
+            if (!detail::origin(embed).empty())
+                headers.push_back("Origin: " + detail::origin(embed));
         }
 
-        if (m3u8.empty()) continue;
+        if (m3u8.empty()) {
+            char marker[192];
+            std::snprintf(marker, sizeof(marker), "%s SERVER UNRESOLVED name=%s type=%s host=%s",
+                detail::source_tag(base), server.name.c_str(), server.type.c_str(),
+                detail::host_of(embed).c_str());
+            ::saikou_debug_log(marker);
+            continue;
+        }
         std::vector<Stream> variants = detail::hls(
             m3u8, detail::trim(server.name) + " - " + detail::trim(server.type),
             referer, headers);
