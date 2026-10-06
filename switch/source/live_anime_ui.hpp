@@ -1630,8 +1630,11 @@ static std::vector<ProviderEpisode> fetch_provider_episodes(
                     anikoto::fetch_episodes(title, baseUrl, sourceStatus);
                 if (found.empty())
                 {
+                    if (!sourceStatus.empty())
+                        status = sourceStatus;
                     log_stage((std::string(api_source_name(sourceId)) +
-                        " title lookup miss; trying next AniList title").c_str());
+                        " title lookup miss; " +
+                        (sourceStatus.empty() ? std::string("no detail") : sourceStatus)).c_str());
                     continue;
                 }
 
@@ -1817,10 +1820,15 @@ public:
         m_focusSink->setFocusable(true);
         root->addView(m_focusSink);
 
-        m_streamRow = new brls::Box(brls::Axis::ROW);
+        m_streamRow = new brls::HScrollingFrame();
         m_streamRow->setWidthPercentage(100.0f);
         m_streamRow->setHeight(70.0f);
         m_streamRow->setMargins(0, 12, 0, 0);
+        m_streamRow->setScrollingBehavior(brls::ScrollingBehavior::NATURAL);
+        m_streamChoicesRow = new brls::Box(brls::Axis::ROW);
+        m_streamChoicesRow->setWidth(1160.0f);
+        m_streamChoicesRow->setHeight(70.0f);
+        m_streamRow->setContentView(m_streamChoicesRow);
         root->addView(m_streamRow);
 
         brls::Label* playerStatus = new brls::Label();
@@ -1846,7 +1854,7 @@ public:
         if (m_worker.joinable()) m_worker.join();
         m_ready.store(false, std::memory_order_release);
         if (m_sourceStatus) m_sourceStatus->setText(m_statusText);
-        clear_box(m_streamRow);
+        clear_box(m_streamChoicesRow);
         m_streamChoices.clear();
         if (m_streams.empty())
         {
@@ -1888,8 +1896,11 @@ public:
                     return true;
                 });
             m_streamChoices.push_back(choice);
-            m_streamRow->addView(choice);
+            m_streamChoicesRow->addView(choice);
         }
+        m_streamChoicesRow->setWidth(std::max(
+            1160.0f, static_cast<float>(m_streams.size()) * 219.0f));
+        m_streamChoicesRow->setDefaultFocusedIndex(0);
         if (!m_streamChoices.empty())
             brls::Application::giveFocus(m_streamChoices[0]);
     }
@@ -1899,7 +1910,8 @@ private:
     ProviderEpisode m_providerEpisode;
     int m_sourceId = 0;
     size_t m_selectedStream = 0;
-    brls::Box* m_streamRow = nullptr;
+    brls::HScrollingFrame* m_streamRow = nullptr;
+    brls::Box* m_streamChoicesRow = nullptr;
     brls::Label* m_sourceStatus = nullptr;
     std::vector<brls::Box*> m_streamChoices;
     std::vector<ProviderStream> m_streams;
