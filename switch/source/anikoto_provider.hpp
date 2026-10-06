@@ -664,12 +664,24 @@ static std::vector<Stream> hls(const std::string& master, const std::string& pre
     const Response r = get(master, requestHeaders);
     std::vector<Stream> out;
     const bool hasPlaylistSignature = r.body.find("#EXTM3U") != std::string::npos;
-    if (r.code < 200 || r.code >= 300 || !hasPlaylistSignature) {
+    const bool urlLooksLikePlaylist = lower(path_only(master)).find(".m3u8") != std::string::npos;
+    if (r.code < 200 || r.code >= 300 || (!hasPlaylistSignature && !urlLooksLikePlaylist)) {
+        char marker[224];
+        std::snprintf(marker, sizeof(marker),
+            "%s HLS REJECT status=%ld bytes=%zu extm3u=%d content=%s host=%s path_m3u8=%d",
+            source_tag(referer), r.code, r.body.size(), hasPlaylistSignature ? 1 : 0,
+            r.contentType.c_str(), host_of(master).c_str(), urlLooksLikePlaylist ? 1 : 0);
+        ::saikou_debug_log(marker);
+        return out;
+    }
+    if (!hasPlaylistSignature) {
+        // Some Anichi CDN endpoints serve an MPEG-TS payload through an .m3u8
+        // route with application/octet-stream. Let libmpv probe it directly.
+        out.push_back({master, "Auto", prefix, extraHeaders});
         char marker[192];
         std::snprintf(marker, sizeof(marker),
-            "%s HLS REJECT status=%ld bytes=%zu extm3u=%d content=%s host=%s",
-            source_tag(referer), r.code, r.body.size(), hasPlaylistSignature ? 1 : 0,
-            r.contentType.c_str(), host_of(master).c_str());
+            "%s HLS BODY NOT PLAYLIST; PASSING URL TO MPV host=%s",
+            source_tag(referer), host_of(master).c_str());
         ::saikou_debug_log(marker);
         return out;
     }
