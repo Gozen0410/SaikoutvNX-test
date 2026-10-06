@@ -402,7 +402,13 @@ static std::string parse_server_embed(const std::string& base, const Server& s, 
         "Referer: " + base + epUrl,
         "X-Requested-With: XMLHttpRequest"
     });
-    if (r.code < 200 || r.code >= 300) return {};
+    if (r.code < 200 || r.code >= 300) {
+        char marker[128];
+        std::snprintf(marker, sizeof(marker), "%s SERVER API REJECT status=%ld bytes=%zu",
+            source_tag(base), r.code, r.body.size());
+        ::saikou_debug_log(marker);
+        return {};
+    }
     // The site's server endpoint returns {"result":{"url":"..."}}. Older
     // versions returned an HTML string, so accept both response shapes.
     std::string embed = json_string(r.body, "url");
@@ -430,7 +436,13 @@ static std::string mega_source(const std::string& embed, const std::string& serv
         "Referer: " + o + "/",
         "X-Requested-With: XMLHttpRequest"
     });
-    if (page.code < 200 || page.code >= 300) return {};
+    if (page.code < 200 || page.code >= 300) {
+        char marker[160];
+        std::snprintf(marker, sizeof(marker), "%s PLAYER PAGE REJECT status=%ld bytes=%zu host=%s",
+            source_tag(embed), page.code, page.body.size(), host_of(embed).c_str());
+        ::saikou_debug_log(marker);
+        return {};
+    }
 
     std::string mediaId;
     size_t p = 0;
@@ -443,7 +455,13 @@ static std::string mega_source(const std::string& embed, const std::string& serv
         if (!mediaId.empty()) break;
         p = e + 1;
     }
-    if (mediaId.empty()) return {};
+    if (mediaId.empty()) {
+        char marker[160];
+        std::snprintf(marker, sizeof(marker), "%s PLAYER PAGE NO DATA ID bytes=%zu host=%s content=%s",
+            source_tag(embed), page.body.size(), host_of(embed).c_str(), page.contentType.c_str());
+        ::saikou_debug_log(marker);
+        return {};
+    }
 
     std::string streamType = "sub";
     const std::string typeLower = lower(serverType);
@@ -496,11 +514,18 @@ static std::string mega_source(const std::string& embed, const std::string& serv
 
     Response source = get(api, apiHeaders);
     std::string m3u8 = source.code >= 200 && source.code < 300 ? extractSource(source) : std::string();
+    char marker[192];
+    std::snprintf(marker, sizeof(marker), "%s SOURCES API status=%ld bytes=%zu content=%s parsed=%d",
+        source_tag(embed), source.code, source.body.size(), source.contentType.c_str(), m3u8.empty() ? 0 : 1);
+    ::saikou_debug_log(marker);
     if (m3u8.empty()) {
         const std::string fallback = o + "/stream/getSourcesNew?id=" + url_encode(mediaId) +
             "&id=" + url_encode(mediaId) + "&type=" + streamType + "&type=" + streamType;
         source = get(fallback, apiHeaders);
         if (source.code >= 200 && source.code < 300) m3u8 = extractSource(source);
+        std::snprintf(marker, sizeof(marker), "%s SOURCES NEW status=%ld bytes=%zu content=%s parsed=%d",
+            source_tag(embed), source.code, source.body.size(), source.contentType.c_str(), m3u8.empty() ? 0 : 1);
+        ::saikou_debug_log(marker);
     }
     if (m3u8.empty()) return {};
     m3u8 = resolve_url(embed, m3u8);
@@ -689,6 +714,10 @@ static std::string player_page_source(const std::string& embed, const std::strin
             }
         }
     }
+    char marker[160];
+    std::snprintf(marker, sizeof(marker), "%s PLAYER PAGE NO PLAYABLE URL bytes=%zu host=%s content=%s",
+        source_tag(embed), page.body.size(), host_of(embed).c_str(), page.contentType.c_str());
+    ::saikou_debug_log(marker);
     return {};
 }
 
