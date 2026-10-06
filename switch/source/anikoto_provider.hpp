@@ -76,6 +76,28 @@ static std::string url_encode(const std::string& s) {
     return out;
 }
 
+static std::string url_decode(const std::string& value) {
+    std::string out;
+    for (size_t i = 0; i < value.size(); ++i) {
+        if (value[i] == '%' && i + 2 < value.size()) {
+            const auto hexValue = [](char c) -> int {
+                if (c >= '0' && c <= '9') return c - '0';
+                if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                return -1;
+            };
+            const int hi = hexValue(value[i + 1]), lo = hexValue(value[i + 2]);
+            if (hi >= 0 && lo >= 0) {
+                out.push_back(static_cast<char>((hi << 4) | lo));
+                i += 2;
+                continue;
+            }
+        }
+        out.push_back(value[i] == '+' ? ' ' : value[i]);
+    }
+    return out;
+}
+
 static Response get(const std::string& url, const std::vector<std::string>& headers = {}, long timeout = 25) {
     Response r;
     CURL* c = curl_easy_init();
@@ -274,6 +296,56 @@ static std::string json_string(const std::string& json, const std::string& key) 
         else out.push_back(c);
     }
     return {};
+}
+
+static std::string episode_param(const std::string& id, const std::string& name) {
+    const std::string marker = "&" + name + "=";
+    size_t p = id.find(marker);
+    if (p == std::string::npos) return {};
+    p += marker.size();
+    const size_t end = id.find('&', p);
+    return url_decode(id.substr(p, end == std::string::npos ? std::string::npos : end - p));
+}
+
+static std::vector<Server> mapper_servers(const std::string& episodeId, const std::string& base) {
+    const std::string mal = episode_param(episodeId, "mal");
+    const std::string slug = episode_param(episodeId, "slug");
+    const std::string timestamp = episode_param(episodeId, "ts");
+    if (mal.empty() || slug.empty() || timestamp.empty()) return {};
+
+    const std::string url = "https://mapper.nekostream.site/api/mal/" +
+        url_encode(mal) + "/" + url_encode(slug) + "/" + url_encode(timestamp);
+    const Response response = get(url, {
+        "Accept: application/json, text/javascript, */*; q=0.01",
+        "Origin: " + base,
+        "Referer: " + base + "/"
+    });
+    char marker[160];
+    if (response.code < 200 || response.code >= 300) {
+        std::snprintf(marker, sizeof(marker), "ANICHI MAPPER REJECT status=%ld bytes=%zu",
+            response.code, response.body.size());
+        ::saikou_debug_log(marker);
+        return {};
+    }
+
+    std::vector<Server> out;
+    std::set<std::string> seen;
+    size_t p = 0;
+    while ((p = response.body.find("\\"url\\"", p)) != std::string::npos) {
+        const size_t dub = response.body.rfind("\\"dub\\"", p);
+        const size_t sub = response.body.rfind("\\"sub\\"", p);
+        const bool isDub = dub != std::string::npos && (sub == std::string::npos || dub > sub);
+        const size_t colon = response.body.find(':', p + 5);
+        if (colon == std::string::npos) break;
+        const std::string streamUrl = json_string(response.body.substr(p), "url");
+        if (streamUrl.rfind("http", 0) == 0 && seen.insert(streamUrl).second)
+            out.push_back({isDub ? "Dub" : "Sub", streamUrl, "Mapper"});
+        p = colon + 1;
+    }
+    std::snprintf(marker, sizeof(marker), "ANICHI MAPPER READY status=%ld bytes=%zu links=%zu",
+        response.code, response.body.size(), out.size());
+    ::saikou_debug_log(marker);
+    return out;
 }
 
 static std::string resolve_url(const std::string& base, const std::string& rel) {
@@ -820,7 +892,11 @@ inline std::vector<Stream> fetch_streams(const Episode& episode, const std::stri
     }
 
     const std::string html = detail::result_html(list.body);
-    const std::vector<detail::Server> servers = detail::parse_servers(html);
+    std::vector<detail::Server> servers = detail::parse_servers(html);
+    if (detail::lower(base).find("anichi") != std::string::npos) {
+        std::vector<detail::Server> mapped = detail::mapper_servers(episode.id, base);
+        servers.insert(servers.end(), mapped.begin(), mapped.end());
+    }
     if (servers.empty()) { status = "Source returned no server entries."; return {}; }
 
     std::vector<Stream> out;
