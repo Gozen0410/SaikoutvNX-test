@@ -874,7 +874,8 @@ static std::string player_page_source(const std::string& embed, const std::strin
 
     const std::string dataId = find_data_id(page.body);
     if (!dataId.empty()) {
-        const std::string result = mega_source(embed, serverType);
+        std::vector<Subtitle> ignoredSubtitles;
+        const std::string result = mega_source(embed, serverType, ignoredSubtitles);
         if (!result.empty()) return result;
     }
 
