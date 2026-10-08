@@ -70,8 +70,10 @@ void onMpvRenderUpdate(void*)
 }
 
 
-SaikouMpvVideoView::SaikouMpvVideoView(std::string url, std::vector<std::string> headers)
-    : m_headers(std::move(headers))
+SaikouMpvVideoView::SaikouMpvVideoView(std::string url, std::vector<std::string> headers,
+                                       std::vector<SaikouMpvPlayerSubtitle> subtitles)
+    : m_headers(std::move(headers)),
+      m_subtitles(std::move(subtitles))
 {
     setFocusable(false);
     m_mpv = mpv_create();
@@ -90,6 +92,9 @@ SaikouMpvVideoView::SaikouMpvVideoView(std::string url, std::vector<std::string>
     mpv_set_option_string(m_mpv, "keep-open", "yes");
     mpv_set_option_string(m_mpv, "osc", "no");
     mpv_set_option_string(m_mpv, "osd-level", "0");
+    // Provider subtitles are loaded explicitly after the media is ready.
+    mpv_set_option_string(m_mpv, "sub-auto", "no");
+    mpv_set_option_string(m_mpv, "slang", "eng,en");
     mpv_set_option_string(m_mpv, "audio-channels", "stereo");
     mpv_set_option_string(m_mpv, "cache", "yes");
     mpv_set_option_string(m_mpv, "network-timeout", "30");
@@ -184,6 +189,36 @@ void SaikouMpvVideoView::togglePause()
     m_status = "Playback controls: A pause/resume  |  B back";
 }
 
+void SaikouMpvVideoView::loadSubtitles()
+{
+    if (!m_mpv || m_subtitles.empty())
+        return;
+
+    for (size_t i = 0; i < m_subtitles.size(); ++i)
+    {
+        const SaikouMpvPlayerSubtitle& subtitle = m_subtitles[i];
+        // The provider list is ordered with English first when available, so
+        // select the first track and keep the remaining tracks available for
+        // later subtitle cycling.
+        const char* flags = (i == 0) ? "select" : "auto";
+        const char* command[] = {
+            "sub-add",
+            subtitle.url.c_str(),
+            flags,
+            subtitle.label.c_str(),
+            subtitle.language.c_str(),
+            nullptr
+        };
+        const int result = mpv_command_async(m_mpv, 0, command);
+        if (result < 0)
+            brls::Logger::warn("mpv subtitle load failed: {}", mpv_error_string(result));
+    }
+
+    char marker[128];
+    std::snprintf(marker, sizeof(marker), "MPV SUBTITLES ADDED count=%zu", m_subtitles.size());
+    saikou_debug_log(marker);
+}
+
 void SaikouMpvVideoView::handleEvents()
 {
     if (!m_mpv)
@@ -218,6 +253,7 @@ void SaikouMpvVideoView::handleEvents()
                 if (mpv_get_property(m_mpv, "dheight", MPV_FORMAT_INT64, &value) >= 0 && value > 0)
                     m_videoHeight = static_cast<int>(value);
                 m_framePending = true;
+                loadSubtitles();
                 m_status = "Playing  |  A pause/resume  |  B back";
                 brls::Logger::info("mpv stream loaded video={}x{}", m_videoWidth, m_videoHeight);
                 saikou_debug_log("MPV FILE LOADED");
@@ -373,12 +409,13 @@ void SaikouMpvVideoView::draw(NVGcontext* vg, float x, float y, float width,
 
 SaikouMpvPlayerActivity::SaikouMpvPlayerActivity(
     std::string animeTitle, std::string episodeTitle, std::string streamLabel, std::string url,
-    std::vector<std::string> headers)
+    std::vector<std::string> headers, std::vector<SaikouMpvPlayerSubtitle> subtitles)
     : m_animeTitle(std::move(animeTitle)),
       m_episodeTitle(std::move(episodeTitle)),
       m_streamLabel(std::move(streamLabel)),
       m_url(std::move(url)),
-      m_headers(std::move(headers))
+      m_headers(std::move(headers)),
+      m_subtitles(std::move(subtitles))
 {
 }
 
@@ -414,7 +451,7 @@ brls::View* SaikouMpvPlayerActivity::createContentView()
     episode->setMargins(0, 4, 0, 0);
     root->addView(episode);
 
-    m_video = new SaikouMpvVideoView(m_url, m_headers);
+    m_video = new SaikouMpvVideoView(m_url, m_headers, m_subtitles);
     m_video->setWidthPercentage(100.0f);
     m_video->setGrow(1.0f);
     m_video->setMargins(0, 12, 0, 0);
