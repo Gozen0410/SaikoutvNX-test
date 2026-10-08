@@ -358,6 +358,13 @@ static std::vector<Subtitle> parse_subtitle_tracks(const std::string& payload, c
         p = objectEnd + 1;
     }
 
+    std::stable_sort(out.begin(), out.end(), [](const Subtitle& a, const Subtitle& b) {
+        const std::string al = lower(a.language + " " + a.label);
+        const std::string bl = lower(b.language + " " + b.label);
+        const bool ae = al.find("en") != std::string::npos || al.find("english") != std::string::npos;
+        const bool be = bl.find("en") != std::string::npos || bl.find("english") != std::string::npos;
+        return ae && !be;
+    });
     return out;
 }
 
