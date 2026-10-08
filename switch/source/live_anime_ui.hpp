@@ -9,6 +9,7 @@
 #include <switch.h>
 #include "api_sources.hpp"
 #include "mpv_player.hpp"
+#include "hls_proxy.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -1767,6 +1768,9 @@ public:
     {
         m_lifetime->store(false, std::memory_order_release);
         if (m_worker.joinable()) m_worker.join();
+        // The play-preparation worker only holds copies of the stream data and
+        // shared state; let it finish in the background if the screen closed.
+        if (m_playWorker.joinable()) m_playWorker.detach();
         if (g_episodeStreamActivity == this) g_episodeStreamActivity = nullptr;
     }
 
@@ -1885,14 +1889,7 @@ public:
                         "NATIVE PLAYER OPEN: source=%s option=%s headers=%zu",
                         api_source_name(m_sourceId), label.c_str(), selected.headers.size());
                     log_stage(playerMarker);
-                    brls::Application::pushActivity(
-                        new SaikouMpvPlayerActivity(
-                            m_anime.title,
-                            m_providerEpisode.title,
-                            label,
-                            selected.url,
-                            selected.headers),
-                        brls::TransitionAnimation::NONE);
+                    open_native_player(selected, label);
                     return true;
                 });
             m_streamChoices.push_back(choice);
@@ -1921,6 +1918,75 @@ private:
     std::atomic<bool> m_ready{ false };
     std::shared_ptr<std::atomic<bool>> m_lifetime =
         std::make_shared<std::atomic<bool>>(true);
+    std::thread m_playWorker;
+    std::shared_ptr<std::atomic<bool>> m_playStarting =
+        std::make_shared<std::atomic<bool>>(false);
+
+    // Prepare the selected stream off the UI thread, then open the native
+    // player. For non-KAA HLS streams this probes for segments disguised as
+    // images and repairs them through the local proxy (ported from AnikkuNX).
+    // KickAssAnime keeps its hardware-proven direct path untouched.
+    void open_native_player(const ProviderStream& stream, const std::string& label)
+    {
+        if (m_playStarting->exchange(true, std::memory_order_acq_rel))
+            return; // a stream is already being prepared
+        if (m_playWorker.joinable()) m_playWorker.join();
+
+        const std::string url = stream.url;
+        const std::vector<std::string> headers = stream.headers;
+        const std::string animeTitle = m_anime.title;
+        const std::string episodeTitle = m_providerEpisode.title;
+        const int sourceId = m_sourceId;
+        const auto lifetime = m_lifetime;
+        const auto starting = m_playStarting;
+
+        m_playWorker = std::thread([lifetime, starting, url, headers, animeTitle, episodeTitle, label, sourceId] {
+            std::string playUrl = url;
+            if (sourceId != static_cast<int>(ApiSourceId::KickAssAnime))
+            {
+                std::string low = url;
+                for (char& c : low) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                if (low.find(".m3u8") != std::string::npos)
+                {
+                    hlsproxy::setLogPath("sdmc:/switch/SaikouTV/proxy.log");
+                    log_stage("PLAY PREPARE: probing disguised-image HLS segments");
+                    if (hlsproxy::needsProxy(url, headers))
+                    {
+                        const std::string wrapped = hlsproxy::wrap(url, headers);
+                        if (!wrapped.empty())
+                        {
+                            playUrl = wrapped;
+                            log_stage("PLAY PREPARE: wrapped stream through local HLS proxy");
+                        }
+                        else
+                        {
+                            log_stage("PLAY PREPARE: proxy wrap failed; using direct URL");
+                        }
+                    }
+                    else
+                    {
+                        log_stage("PLAY PREPARE: segments are clean; using direct URL");
+                    }
+                }
+            }
+            if (!lifetime->load(std::memory_order_acquire))
+            {
+                starting->store(false, std::memory_order_release);
+                return;
+            }
+            brls::sync([lifetime, starting, playUrl, headers, animeTitle, episodeTitle, label] {
+                if (!lifetime->load(std::memory_order_acquire))
+                {
+                    starting->store(false, std::memory_order_release);
+                    return;
+                }
+                brls::Application::pushActivity(
+                    new SaikouMpvPlayerActivity(animeTitle, episodeTitle, label, playUrl, headers),
+                    brls::TransitionAnimation::NONE);
+                starting->store(false, std::memory_order_release);
+            });
+        });
+    }
 
     brls::Box* make_option(const std::string& text, bool selected)
     {
