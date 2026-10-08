@@ -943,12 +943,20 @@ struct ProviderEpisode
     std::string category;
 };
 
+struct ProviderSubtitle
+{
+    std::string url;
+    std::string label;
+    std::string language;
+};
+
 struct ProviderStream
 {
     std::string url;
     std::string quality;
     std::string type;
     std::vector<std::string> headers;
+    std::vector<ProviderSubtitle> subtitles;
 };
 
 static std::string encode_url_component(const std::string& input)
@@ -1885,13 +1893,17 @@ public:
                         "NATIVE PLAYER OPEN: source=%s option=%s headers=%zu",
                         api_source_name(m_sourceId), label.c_str(), selected.headers.size());
                     log_stage(playerMarker);
+                    std::vector<SaikouMpvPlayerSubtitle> playerSubtitles;
+                    for (const ProviderSubtitle& sub : selected.subtitles)
+                        playerSubtitles.push_back({sub.url, sub.label, sub.language});
                     brls::Application::pushActivity(
                         new SaikouMpvPlayerActivity(
                             m_anime.title,
                             m_providerEpisode.title,
                             label,
                             selected.url,
-                            selected.headers),
+                            selected.headers,
+                            playerSubtitles),
                         brls::TransitionAnimation::NONE);
                     return true;
                 });
@@ -1968,7 +1980,14 @@ private:
                     anikoto::fetch_streams(sourceEpisode, baseUrl, m_statusText);
                 m_streams.clear();
                 for (const anikoto::Stream& stream : found)
-                    m_streams.push_back({stream.url, stream.quality, stream.type, stream.headers});
+                {
+                    ProviderStream providerStream{
+                        stream.url, stream.quality, stream.type, stream.headers, {}
+                    };
+                    for (const anikoto::Subtitle& sub : stream.subtitles)
+                        providerStream.subtitles.push_back({sub.url, sub.label, sub.language});
+                    m_streams.push_back(std::move(providerStream));
+                }
                 char marker[160];
                 std::snprintf(marker, sizeof(marker), "%s STREAMS READY count=%zu status=%s",
                     api_source_name(m_sourceId), m_streams.size(), m_statusText.c_str());

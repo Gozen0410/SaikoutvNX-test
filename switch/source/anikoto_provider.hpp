@@ -24,11 +24,18 @@ struct Episode {
     std::string id;
 };
 
+struct Subtitle {
+    std::string url;
+    std::string label;
+    std::string language;
+};
+
 struct Stream {
     std::string url;
     std::string quality;
     std::string type;
     std::vector<std::string> headers;
+    std::vector<Subtitle> subtitles;
 };
 
 namespace detail {
@@ -301,6 +308,66 @@ static std::string json_string(const std::string& json, const std::string& key) 
     return {};
 }
 
+static std::string resolve_url(const std::string& base, const std::string& rel);
+
+static std::vector<Subtitle> parse_subtitle_tracks(const std::string& payload, const std::string& baseUrl) {
+    std::vector<Subtitle> out;
+    std::set<std::string> seen;
+
+    size_t p = 0;
+    while ((p = payload.find("\"file\"", p)) != std::string::npos) {
+        const size_t objectStart = payload.rfind('{', p);
+        const size_t objectEnd = payload.find('}', p);
+        if (objectStart == std::string::npos || objectEnd == std::string::npos || objectEnd <= objectStart) {
+            p += 6;
+            continue;
+        }
+
+        const std::string object = payload.substr(objectStart, objectEnd - objectStart + 1);
+        std::string kind = lower(json_string(object, "kind"));
+        std::string url = json_string(object, "file");
+        if (url.empty()) url = json_string(object, "url");
+        if (url.empty()) url = json_string(object, "src");
+
+        std::string label = json_string(object, "label");
+        if (label.empty()) label = json_string(object, "name");
+        std::string language = json_string(object, "language");
+        if (language.empty()) language = json_string(object, "lang");
+
+        const std::string lowUrl = lower(url);
+        const bool subtitleKind =
+            kind.find("subtitle") != std::string::npos ||
+            kind.find("caption") != std::string::npos ||
+            kind == "sub";
+        const bool subtitleExtension =
+            lowUrl.find(".vtt") != std::string::npos ||
+            lowUrl.find(".srt") != std::string::npos ||
+            lowUrl.find(".ass") != std::string::npos ||
+            lowUrl.find(".ssa") != std::string::npos;
+
+        if (!url.empty() && (subtitleKind || subtitleExtension)) {
+            url = resolve_url(baseUrl, url);
+            if (url.rfind("http://", 0) == 0 || url.rfind("https://", 0) == 0) {
+                if (seen.insert(url).second) {
+                    if (label.empty()) label = language.empty() ? "Subtitles" : language;
+                    out.push_back({url, label, language});
+                }
+            }
+        }
+
+        p = objectEnd + 1;
+    }
+
+    std::stable_sort(out.begin(), out.end(), [](const Subtitle& a, const Subtitle& b) {
+        const std::string al = lower(a.language + " " + a.label);
+        const std::string bl = lower(b.language + " " + b.label);
+        const bool ae = al.find("en") != std::string::npos || al.find("english") != std::string::npos;
+        const bool be = bl.find("en") != std::string::npos || bl.find("english") != std::string::npos;
+        return ae && !be;
+    });
+    return out;
+}
+
 struct Server { std::string type; std::string id; std::string name; };
 
 static std::string episode_param(const std::string& id, const std::string& name) {
@@ -502,7 +569,8 @@ static std::string parse_server_embed(const std::string& base, const Server& s, 
     return resolve_url(base + epUrl, embed);
 }
 
-static std::string mega_source(const std::string& embed, const std::string& /*serverType*/) {
+static std::string mega_source(const std::string& embed, const std::string& /*serverType*/,
+                               std::vector<Subtitle>& subtitles) {
     const std::string o = origin(embed);
     if (o.empty()) return {};
     const Response page = get(embed, {
@@ -556,15 +624,17 @@ static std::string mega_source(const std::string& embed, const std::string& /*se
     };
     auto extractSource = [&](const Response& source) {
         std::string result;
+        std::string payload;
         const std::string enc = json_string(source.body, "enc");
         if (!enc.empty()) {
             try {
                 std::string key = "i?LMTAx0Q6,:}50U";
                 key.resize(32, '\0');
                 const std::string raw = crypto::base64Decode(enc);
-                if (!raw.empty() && raw.size() % 16 == 0)
-                    result = json_string(
-                        crypto::aesCbcDecrypt(raw, key, "W0;27ToaUpl_P%'c"), "file");
+                if (!raw.empty() && raw.size() % 16 == 0) {
+                    payload = crypto::aesCbcDecrypt(raw, key, "W0;27ToaUpl_P%'c");
+                    result = json_string(payload, "file");
+                }
             } catch (...) {}
         }
         if (result.empty()) {
@@ -575,6 +645,17 @@ static std::string mega_source(const std::string& embed, const std::string& /*se
             }
         }
         if (result.empty()) result = json_string(source.body, "file");
+
+        std::vector<Subtitle> parsed;
+        if (!payload.empty()) parsed = parse_subtitle_tracks(payload, embed);
+        const std::vector<Subtitle> fromWrapper = parse_subtitle_tracks(source.body, embed);
+        for (const Subtitle& track : fromWrapper) {
+            bool duplicate = false;
+            for (const Subtitle& existing : parsed)
+                if (existing.url == track.url) { duplicate = true; break; }
+            if (!duplicate) parsed.push_back(track);
+        }
+        subtitles = std::move(parsed);
         return result;
     };
 
@@ -793,7 +874,8 @@ static std::string player_page_source(const std::string& embed, const std::strin
 
     const std::string dataId = find_data_id(page.body);
     if (!dataId.empty()) {
-        const std::string result = mega_source(embed, serverType);
+        std::vector<Subtitle> ignoredSubtitles;
+        const std::string result = mega_source(embed, serverType, ignoredSubtitles);
         if (!result.empty()) return result;
     }
 
@@ -940,6 +1022,7 @@ inline std::vector<Stream> fetch_streams(const Episode& episode, const std::stri
 
         std::string m3u8;
         std::vector<std::string> headers;
+        std::vector<Subtitle> subtitles;
         std::string referer = base + "/";
         bool allowOpaqueMedia = false;
         const std::string low = detail::lower(embed);
@@ -947,7 +1030,7 @@ inline std::vector<Stream> fetch_streams(const Episode& episode, const std::stri
         if ((low.find("megaplay.") != std::string::npos || low.find("vidtube.site") != std::string::npos) &&
             low.find("/stream/") != std::string::npos) {
             allowOpaqueMedia = true;
-            m3u8 = detail::mega_source(embed, server.type);
+            m3u8 = detail::mega_source(embed, server.type, subtitles);
             referer = detail::origin(embed) + "/";
             headers.push_back("Origin: " + detail::origin(embed));
         } else if (low.find("mewcdn.online/player/plyr.php") != std::string::npos) {
@@ -978,6 +1061,7 @@ inline std::vector<Stream> fetch_streams(const Episode& episode, const std::stri
         for (auto& v : variants) {
             v.type = detail::trim(server.name); if (!detail::trim(server.type).empty()) v.type += "  " + detail::trim(server.type);
             v.headers.push_back("Referer: " + referer);
+            v.subtitles = subtitles;
             const std::string key = v.url + "|" + v.quality + "|" + v.type;
             if (seen.insert(key).second) out.push_back(std::move(v));
         }
