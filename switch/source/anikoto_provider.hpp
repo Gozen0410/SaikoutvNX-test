@@ -555,6 +555,22 @@ static std::string mega_source(const std::string& embed, const std::string& /*se
         "Referer: " + embed
     };
     auto extractSource = [&](const Response& source) {
+        auto isHlsUrl = [](const std::string& value) {
+            return lower(value).find(".m3u8") != std::string::npos;
+        };
+        // MegaPlay's "tracks" array also contains fields named "file" (usually .vtt).
+        // Only accept an HLS manifest as the playback URL; otherwise MPV is handed
+        // a subtitle file and reports that no audio/video data was played.
+        auto firstHlsFile = [&](const std::string& body) {
+            size_t p = 0;
+            while ((p = body.find("\\"file\\"", p)) != std::string::npos) {
+                const std::string candidate = json_string(body.substr(p), "file");
+                if (isHlsUrl(candidate)) return candidate;
+                p += 6;
+            }
+            return std::string();
+        };
+
         std::string result;
         const std::string enc = json_string(source.body, "enc");
         if (!enc.empty()) {
@@ -563,18 +579,17 @@ static std::string mega_source(const std::string& embed, const std::string& /*se
                 key.resize(32, '\0');
                 const std::string raw = crypto::base64Decode(enc);
                 if (!raw.empty() && raw.size() % 16 == 0)
-                    result = json_string(
-                        crypto::aesCbcDecrypt(raw, key, "W0;27ToaUpl_P%'c"), "file");
+                    result = firstHlsFile(
+                        crypto::aesCbcDecrypt(raw, key, "W0;27ToaUpl_P%'c"));
             } catch (...) {}
         }
+        // Prefer a real manifest from the plain sources field if the encrypted
+        // payload only exposed subtitle tracks.
+        if (result.empty()) result = firstHlsFile(source.body);
         if (result.empty()) {
-            const size_t s0 = source.body.find("\"sources\"");
-            if (s0 != std::string::npos) {
-                const size_t f = source.body.find("\"file\"", s0);
-                if (f != std::string::npos) result = json_string(source.body.substr(f), "file");
-            }
+            const std::string sources = json_string(source.body, "sources");
+            if (isHlsUrl(sources)) result = sources;
         }
-        if (result.empty()) result = json_string(source.body, "file");
         return result;
     };
 
