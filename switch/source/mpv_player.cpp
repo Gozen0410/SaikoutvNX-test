@@ -7,6 +7,7 @@
 #include <GLFW/glfw3.h>
 
 #include <atomic>
+#include <cctype>
 #include <utility>
 #include <vector>
 
@@ -27,10 +28,40 @@ extern "C"
 #define nvglCreateImageFromHandle nvglCreateImageFromHandleGL3
 #endif
 
+extern void saikou_debug_log(const char* stage);
+
 namespace
 {
 constexpr int kNvgImageNoDelete = 1 << 16;
 std::atomic<bool> gFramePending{true};
+
+std::string redact_mpv_urls(std::string text)
+{
+    for (const char* scheme : { "https://", "http://" }) {
+        size_t pos = 0;
+        while ((pos = text.find(scheme, pos)) != std::string::npos) {
+            size_t end = pos;
+            while (end < text.size() && !std::isspace(static_cast<unsigned char>(text[end])) &&
+                   text[end] != '"' && text[end] != 39)
+                ++end;
+            text.replace(pos, end - pos, "[url]");
+            pos += 5;
+        }
+    }
+    if (text.size() > 220) text.resize(220);
+    return text;
+}
+
+const char* mpv_log_level_name(mpv_log_level level)
+{
+    switch (level)
+    {
+        case MPV_LOG_LEVEL_WARN: return "warn";
+        case MPV_LOG_LEVEL_ERROR: return "error";
+        case MPV_LOG_LEVEL_FATAL: return "fatal";
+        default: return nullptr;
+    }
+}
 
 void onMpvRenderUpdate(void*)
 {
@@ -65,7 +96,7 @@ SaikouMpvVideoView::SaikouMpvVideoView(std::string url, std::vector<std::string>
     mpv_set_option_string(m_mpv, "tls-verify", "no");
     mpv_set_option_string(m_mpv, "hwdec", "auto");
     // Some anime CDNs use image-like file extensions for HLS segments.
-    mpv_set_option_string(m_mpv, "demuxer-lavf-o", "extension_picky=0");
+    mpv_set_option_string(m_mpv, "demuxer-lavf-o", "extension_picky=0,force_mpegts=1");
     // KAA CDNs validate the page that produced the HLS URL. These headers must
     // follow libmpv into both the master/variant playlists and media segments.
     mpv_set_option_string(m_mpv, "http-user-agent",
@@ -163,6 +194,21 @@ void SaikouMpvVideoView::handleEvents()
             break;
         switch (event->event_id)
         {
+            case MPV_EVENT_LOG_MESSAGE:
+            {
+                auto* message = static_cast<mpv_event_log_message*>(event->data);
+                const char* level = message ? mpv_log_level_name(message->log_level) : nullptr;
+                if (message && level && message->text)
+                {
+                    char marker[320];
+                    const std::string safeText = redact_mpv_urls(message->text);
+                    std::snprintf(marker, sizeof(marker), "MPV %s %s: %s",
+                        level, message->prefix ? message->prefix : "player",
+                        safeText.c_str());
+                    saikou_debug_log(marker);
+                }
+                break;
+            }
             case MPV_EVENT_FILE_LOADED:
             {
                 int64_t value = 0;
@@ -173,6 +219,7 @@ void SaikouMpvVideoView::handleEvents()
                 m_framePending = true;
                 m_status = "Playing  |  A pause/resume  |  B back";
                 brls::Logger::info("mpv stream loaded video={}x{}", m_videoWidth, m_videoHeight);
+                saikou_debug_log("MPV FILE LOADED");
                 break;
             }
             case MPV_EVENT_END_FILE:
@@ -182,10 +229,13 @@ void SaikouMpvVideoView::handleEvents()
                 {
                     m_status = std::string("Playback error: ") + mpv_error_string(end->error);
                     brls::Logger::error("mpv playback ended with error: {}", m_status);
+                    const std::string safeStatus = redact_mpv_urls(m_status);
+                    saikou_debug_log(("MPV PLAYBACK ERROR " + safeStatus).c_str());
                 }
                 else
                 {
                     m_status = "Stream ended  |  B back";
+                    saikou_debug_log("MPV STREAM ENDED");
                 }
                 break;
             }
