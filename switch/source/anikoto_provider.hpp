@@ -502,7 +502,7 @@ static std::string parse_server_embed(const std::string& base, const Server& s, 
     return resolve_url(base + epUrl, embed);
 }
 
-static std::string mega_source(const std::string& embed, const std::string& serverType) {
+static std::string mega_source(const std::string& embed, const std::string& /*serverType*/) {
     const std::string o = origin(embed);
     if (o.empty()) return {};
     const Response page = get(embed, {
@@ -538,17 +538,9 @@ static std::string mega_source(const std::string& embed, const std::string& serv
         return {};
     }
 
-    std::string streamType = "sub";
-    const std::string typeLower = lower(serverType);
-    if (typeLower.find("dub") != std::string::npos) streamType = "dub";
-    else if (typeLower.find("hsub") != std::string::npos || typeLower.find("h-sub") != std::string::npos)
-        streamType = "hsub";
-    const std::string embedLower = lower(embed);
-    if (embedLower.find("/dub") != std::string::npos) streamType = "dub";
-    else if (embedLower.find("/hsub") != std::string::npos) streamType = "hsub";
-
-    std::string api = o + "/stream/getSources?id=" + url_encode(mediaId) +
-        "&id=" + url_encode(mediaId) + "&type=" + streamType + "&type=" + streamType;
+    // The shared Anikoto extractor requests only the media ID (and optional s).
+    // Repeated id/type query keys can make MegaPlay pick an inconsistent source.
+    std::string api = o + "/stream/getSources?id=" + url_encode(mediaId);
     const size_t sp = embed.find("?s=");
     if (sp != std::string::npos) {
         std::string s = embed.substr(sp + 3);
@@ -558,8 +550,7 @@ static std::string mega_source(const std::string& embed, const std::string& serv
     }
 
     const std::vector<std::string> apiHeaders = {
-        "Accept: application/json,text/plain,*/*",
-        "Origin: " + o,
+        "Accept: application/json,*/*",
         "X-Requested-With: XMLHttpRequest",
         "Referer: " + embed
     };
@@ -594,8 +585,7 @@ static std::string mega_source(const std::string& embed, const std::string& serv
         source_tag(embed), source.code, source.body.size(), source.contentType.c_str(), m3u8.empty() ? 0 : 1);
     ::saikou_debug_log(marker);
     if (m3u8.empty()) {
-        const std::string fallback = o + "/stream/getSourcesNew?id=" + url_encode(mediaId) +
-            "&id=" + url_encode(mediaId) + "&type=" + streamType + "&type=" + streamType;
+        const std::string fallback = o + "/stream/getSourcesNew?id=" + url_encode(mediaId);
         source = get(fallback, apiHeaders);
         if (source.code >= 200 && source.code < 300) m3u8 = extractSource(source);
         std::snprintf(marker, sizeof(marker), "%s SOURCES NEW status=%ld bytes=%zu content=%s parsed=%d",
@@ -668,17 +658,27 @@ static std::vector<Stream> hls(const std::string& master, const std::string& pre
     const Response r = get(master, requestHeaders, 25, true);
     std::vector<Stream> out;
     const bool hasPlaylistSignature = r.body.find("#EXTM3U") != std::string::npos;
-    char probe[192];
+    char signature[25] = {};
+    const size_t signatureBytes = std::min<size_t>(8, r.body.size());
+    for (size_t i = 0; i < signatureBytes; ++i)
+        std::snprintf(signature + i * 2, 3, "%02X",
+            static_cast<unsigned char>(r.body[i]));
+    const bool isMp4 = r.body.size() >= 8 && r.body.compare(4, 4, "ftyp") == 0;
+    const bool isTransportStream = r.body.size() >= 377 &&
+        static_cast<unsigned char>(r.body[0]) == 0x47 &&
+        static_cast<unsigned char>(r.body[188]) == 0x47 &&
+        static_cast<unsigned char>(r.body[376]) == 0x47;
+    char probe[224];
     std::snprintf(probe, sizeof(probe),
-        "%s HLS PROBE status=%ld bytes=%zu content=%s extm3u=%d host=%s",
+        "%s HLS PROBE status=%ld bytes=%zu content=%s extm3u=%d sig=%s host=%s",
         sourceName, r.code, r.body.size(), r.contentType.c_str(),
-        hasPlaylistSignature ? 1 : 0, host_of(master).c_str());
+        hasPlaylistSignature ? 1 : 0, signature, host_of(master).c_str());
     ::saikou_debug_log(probe);
     const bool urlLooksLikePlaylist = lower(path_only(master)).find(".m3u8") != std::string::npos;
     const bool opaqueMedia = allowOpaqueMedia && r.code >= 200 && r.code < 300 && !r.body.empty() &&
-        (lower(r.contentType).find("application/octet-stream") != std::string::npos ||
-         lower(r.contentType).find("video/") != std::string::npos ||
-         lower(r.contentType).find("audio/") != std::string::npos);
+        (lower(r.contentType).find("video/") != std::string::npos ||
+         lower(r.contentType).find("audio/") != std::string::npos ||
+         isMp4 || isTransportStream);
     if (r.code < 200 || r.code >= 300 ||
         (!hasPlaylistSignature && !urlLooksLikePlaylist && !opaqueMedia)) {
         char marker[224];
