@@ -555,6 +555,34 @@ static std::string mega_source(const std::string& embed, const std::string& /*se
         "Referer: " + embed
     };
     auto extractSource = [&](const Response& source) {
+        // MegaPlay's raw response also contains a "tracks" array whose entries
+        // have a "file" field pointing at subtitles (.vtt/.srt/.ass). Handing
+        // MPV a subtitle file makes it report "No audio or video data played".
+        // Prefer a real HLS manifest among every "file" value; a non-subtitle
+        // media URL is still acceptable, subtitle files are never chosen when
+        // anything better exists.
+        auto firstMediaFile = [&](const std::string& body) {
+            auto isSubtitleFile = [](const std::string& value) {
+                const std::string v = lower(value);
+                return v.find(".vtt") != std::string::npos ||
+                       v.find(".srt") != std::string::npos ||
+                       v.find(".ass") != std::string::npos;
+            };
+            size_t p = 0;
+            std::string nonSubtitle;
+            while ((p = body.find("\"file\"", p)) != std::string::npos) {
+                const std::string candidate = json_string(body.substr(p), "file");
+                if (!candidate.empty()) {
+                    if (lower(candidate).find(".m3u8") != std::string::npos)
+                        return candidate; // best: real HLS manifest
+                    if (nonSubtitle.empty() && !isSubtitleFile(candidate))
+                        nonSubtitle = candidate; // acceptable: direct media file
+                }
+                p += 6;
+            }
+            return nonSubtitle;
+        };
+
         std::string result;
         const std::string enc = json_string(source.body, "enc");
         if (!enc.empty()) {
@@ -562,11 +590,15 @@ static std::string mega_source(const std::string& embed, const std::string& /*se
                 std::string key = "i?LMTAx0Q6,:}50U";
                 key.resize(32, '\0');
                 const std::string raw = crypto::base64Decode(enc);
-                if (!raw.empty() && raw.size() % 16 == 0)
-                    result = json_string(
-                        crypto::aesCbcDecrypt(raw, key, "W0;27ToaUpl_P%'c"), "file");
+                if (!raw.empty() && raw.size() % 16 == 0) {
+                    const std::string decrypted = crypto::aesCbcDecrypt(raw, key, "W0;27ToaUpl_P%'c");
+                    result = firstMediaFile(decrypted);
+                    if (result.empty())
+                        result = json_string(decrypted, "file");
+                }
             } catch (...) {}
         }
+        if (result.empty()) result = firstMediaFile(source.body);
         if (result.empty()) {
             const size_t s0 = source.body.find("\"sources\"");
             if (s0 != std::string::npos) {
