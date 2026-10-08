@@ -308,6 +308,8 @@ static std::string json_string(const std::string& json, const std::string& key) 
     return {};
 }
 
+static std::string resolve_url(const std::string& base, const std::string& rel);
+
 static std::vector<Subtitle> parse_subtitle_tracks(const std::string& payload, const std::string& baseUrl) {
     std::vector<Subtitle> out;
     std::set<std::string> seen;
