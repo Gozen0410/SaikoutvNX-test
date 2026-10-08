@@ -445,6 +445,8 @@ bool ensureServer()
     return true;
 }
 
+} // namespace
+
 // ------------------------------------------------------------- public surface
 
 bool needsProxy(const std::string& url, const std::vector<std::string>& headers)
@@ -537,7 +539,5 @@ void setLogPath(const std::string& path)
     FILE* f = std::fopen(path.c_str(), "w");
     if (f) std::fclose(f);
 }
-
-} // namespace
 
 } // namespace hlsproxy
