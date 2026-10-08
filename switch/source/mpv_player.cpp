@@ -211,7 +211,7 @@ void SaikouMpvVideoView::loadSubtitles()
         };
         const int result = mpv_command_async(m_mpv, 0, command);
         if (result < 0)
-            brls::Logger::warn("mpv subtitle load failed: {}", mpv_error_string(result));
+            brls::Logger::error("mpv subtitle load failed: {}", mpv_error_string(result));
     }
 
     char marker[128];
